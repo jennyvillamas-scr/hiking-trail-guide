@@ -63,7 +63,6 @@ const dbReady = (async () => {
     )
   `);
 
-  // INDEXES: IMPROVE TRAIL AREA LOOKUPS
   await db.execute(`
     CREATE INDEX IF NOT EXISTS idx_trails_coordinates
     ON trails (latitude, longitude)
@@ -148,21 +147,62 @@ function requireAuth(req, res, next) {
   }
 }
 
+// FIXED: Preserve trail data and ensure database coordinates are included.
 function parseTrail(row) {
   if (!row) return null;
 
+  let data = {};
+
   try {
-    return JSON.parse(row.data_json);
+    const parsed = JSON.parse(row.data_json);
+
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+    ) {
+      data = parsed;
+    }
   } catch {
-    return {
-      id: row.id,
-      name: row.name,
-      region: row.region,
-      latitude: row.latitude,
-      longitude: row.longitude,
-      difficulty: row.difficulty,
-    };
+    // Use database columns when data_json is invalid.
   }
+
+  const latitudeValue =
+    data.latitude ??
+    data.lat ??
+    row.latitude;
+
+  const longitudeValue =
+    data.longitude ??
+    data.lng ??
+    data.lon ??
+    row.longitude;
+
+  const latitude =
+    latitudeValue !== null &&
+    latitudeValue !== undefined &&
+    latitudeValue !== "" &&
+    Number.isFinite(Number(latitudeValue))
+      ? Number(latitudeValue)
+      : null;
+
+  const longitude =
+    longitudeValue !== null &&
+    longitudeValue !== undefined &&
+    longitudeValue !== "" &&
+    Number.isFinite(Number(longitudeValue))
+      ? Number(longitudeValue)
+      : null;
+
+  return {
+    ...data,
+    id: data.id ?? row.id,
+    name: data.name ?? row.name,
+    region: data.region ?? row.region,
+    latitude,
+    longitude,
+    difficulty: data.difficulty ?? row.difficulty,
+  };
 }
 
 function parseTrack(row) {
@@ -583,7 +623,6 @@ app.patch(
 );
 
 // TRAILS: GET ALL
-// Keep this endpoint for screens that need the complete trail list.
 app.get(
   "/api/trails",
   asyncHandler(async (req, res) => {
@@ -603,7 +642,7 @@ app.get(
 );
 
 // TRAILS: GET ONLY THE VISIBLE MAP AREA
-// IMPORTANT: This must be declared before /api/trails/:id.
+// This must be declared before /api/trails/:id.
 app.get(
   "/api/trails/area",
   asyncHandler(async (req, res) => {
