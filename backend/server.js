@@ -976,6 +976,410 @@ app.delete(
   })
 );
 
+
+/* ================================
+   CHAT: FIND USERS
+================================ */
+app.get(
+  "/api/chat/users",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const search =
+      typeof req.query.search === "string"
+        ? req.query.search.trim().slice(0, 50)
+        : "";
+
+    const result = await db.execute({
+      sql: `
+        SELECT id, username, display_name
+        FROM users
+        WHERE id != ?
+          AND (
+            ? = ''
+            OR username LIKE ?
+            OR COALESCE(display_name, '') LIKE ?
+          )
+        ORDER BY username COLLATE NOCASE
+        LIMIT 50
+      `,
+      args: [
+        req.userId,
+        search,
+        `%${search}%`,
+        `%${search}%`,
+      ],
+    });
+
+    res.json({
+      success: true,
+      users: result.rows.map((user) => ({
+        id: Number(user.id),
+        username: user.username,
+        displayName: user.display_name || user.username,
+      })),
+    });
+  })
+);
+
+/* ================================
+   CHAT: LIST CONVERSATIONS
+================================ */
+app.get(
+  "/api/chat/conversations",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const result = await db.execute({
+      sql: `
+        SELECT
+          c.id,
+          c.created_at,
+          u.id AS other_user_id,
+          u.username AS other_username,
+          u.display_name AS other_display_name,
+          (
+            SELECT m.body
+            FROM messages m
+            WHERE m.conversation_id = c.id
+            ORDER BY m.id DESC
+            LIMIT 1
+          ) AS last_message,
+          (
+            SELECT m.created_at
+            FROM messages m
+            WHERE m.conversation_id = c.id
+            ORDER BY m.id DESC
+            LIMIT 1
+          ) AS last_message_at,
+          (
+            SELECT COUNT(*)
+            FROM messages m
+            WHERE m.conversation_id = c.id
+              AND m.sender_id != ?
+              AND m.read_at IS NULL
+          ) AS unread_count
+        FROM conversations c
+        JOIN users u
+          ON u.id = CASE
+            WHEN c.user_one_id = ? THEN c.user_two_id
+            ELSE c.user_one_id
+          END
+        WHERE c.user_one_id = ?
+           OR c.user_two_id = ?
+        ORDER BY
+          COALESCE(
+            (
+              SELECT MAX(m.id)
+              FROM messages m
+              WHERE m.conversation_id = c.id
+            ),
+            c.id
+          ) DESC
+      `,
+      args: [
+        req.userId,
+        req.userId,
+        req.userId,
+        req.userId,
+      ],
+    });
+
+    res.json({
+      success: true,
+      conversations: result.rows.map((row) => ({
+        id: Number(row.id),
+        createdAt: row.created_at,
+        otherUser: {
+          id: Number(row.other_user_id),
+          username: row.other_username,
+          displayName:
+            row.other_display_name || row.other_username,
+        },
+        lastMessage: row.last_message || null,
+        lastMessageAt: row.last_message_at || null,
+        unreadCount: Number(row.unread_count || 0),
+      })),
+    });
+  })
+);
+
+/* ================================
+   CHAT: CREATE OR OPEN CONVERSATION
+================================ */
+app.post(
+  "/api/chat/conversations",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const otherUserId = Number(req.body?.userId);
+
+    if (
+      !Number.isSafeInteger(otherUserId) ||
+      otherUserId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid user ID is required.",
+      });
+    }
+
+    if (otherUserId === req.userId) {
+      return res.status(400).json({
+        success: false,
+        message: "You cannot start a chat with yourself.",
+      });
+    }
+
+    const userResult = await db.execute({
+      sql: `
+        SELECT id, username, display_name
+        FROM users
+        WHERE id = ?
+      `,
+      args: [otherUserId],
+    });
+
+    if (!userResult.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+    }
+
+    const userOneId = Math.min(req.userId, otherUserId);
+    const userTwoId = Math.max(req.userId, otherUserId);
+
+    await db.execute({
+      sql: `
+        INSERT INTO conversations (user_one_id, user_two_id)
+        VALUES (?, ?)
+        ON CONFLICT(user_one_id, user_two_id) DO NOTHING
+      `,
+      args: [userOneId, userTwoId],
+    });
+
+    const conversationResult = await db.execute({
+      sql: `
+        SELECT id, created_at
+        FROM conversations
+        WHERE user_one_id = ? AND user_two_id = ?
+      `,
+      args: [userOneId, userTwoId],
+    });
+
+    const conversation = conversationResult.rows[0];
+    const otherUser = userResult.rows[0];
+
+    res.json({
+      success: true,
+      conversation: {
+        id: Number(conversation.id),
+        createdAt: conversation.created_at,
+        otherUser: {
+          id: Number(otherUser.id),
+          username: otherUser.username,
+          displayName:
+            otherUser.display_name || otherUser.username,
+        },
+      },
+    });
+  })
+);
+
+/* ================================
+   CHAT: GET MESSAGES
+================================ */
+app.get(
+  "/api/chat/conversations/:id/messages",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const conversationId = Number(req.params.id);
+
+    if (
+      !Number.isSafeInteger(conversationId) ||
+      conversationId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid conversation ID.",
+      });
+    }
+
+    const conversationResult = await db.execute({
+      sql: `
+        SELECT id
+        FROM conversations
+        WHERE id = ?
+          AND (user_one_id = ? OR user_two_id = ?)
+      `,
+      args: [conversationId, req.userId, req.userId],
+    });
+
+    if (!conversationResult.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Conversation not found.",
+      });
+    }
+
+    await db.execute({
+      sql: `
+        UPDATE messages
+        SET read_at = CURRENT_TIMESTAMP
+        WHERE conversation_id = ?
+          AND sender_id != ?
+          AND read_at IS NULL
+      `,
+      args: [conversationId, req.userId],
+    });
+
+    const result = await db.execute({
+      sql: `
+        SELECT
+          m.id,
+          m.conversation_id,
+          m.sender_id,
+          m.body,
+          m.created_at,
+          m.read_at,
+          u.username AS sender_username,
+          u.display_name AS sender_display_name
+        FROM messages m
+        JOIN users u ON u.id = m.sender_id
+        WHERE m.conversation_id = ?
+        ORDER BY m.id DESC
+        LIMIT 500
+      `,
+      args: [conversationId],
+    });
+
+    const messages = result.rows.reverse().map((row) => ({
+      id: Number(row.id),
+      conversationId: Number(row.conversation_id),
+      senderId: Number(row.sender_id),
+      senderUsername: row.sender_username,
+      senderDisplayName:
+        row.sender_display_name || row.sender_username,
+      body: row.body,
+      createdAt: row.created_at,
+      readAt: row.read_at || null,
+    }));
+
+    res.json({
+      success: true,
+      messages,
+    });
+  })
+);
+
+/* ================================
+   CHAT: SEND MESSAGE
+================================ */
+app.post(
+  "/api/chat/conversations/:id/messages",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const conversationId = Number(req.params.id);
+    const body =
+      typeof req.body?.body === "string"
+        ? req.body.body.trim()
+        : "";
+
+    if (
+      !Number.isSafeInteger(conversationId) ||
+      conversationId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid conversation ID.",
+      });
+    }
+
+    if (!body) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a message.",
+      });
+    }
+
+    if (body.length > 2000) {
+      return res.status(400).json({
+        success: false,
+        message: "Messages cannot exceed 2,000 characters.",
+      });
+    }
+
+    const conversationResult = await db.execute({
+      sql: `
+        SELECT id
+        FROM conversations
+        WHERE id = ?
+          AND (user_one_id = ? OR user_two_id = ?)
+      `,
+      args: [conversationId, req.userId, req.userId],
+    });
+
+    if (!conversationResult.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Conversation not found.",
+      });
+    }
+
+    const insertResult = await db.execute({
+      sql: `
+        INSERT INTO messages (conversation_id, sender_id, body)
+        VALUES (?, ?, ?)
+      `,
+      args: [conversationId, req.userId, body],
+    });
+
+    const messageResult = await db.execute({
+      sql: `
+        SELECT
+          m.id,
+          m.conversation_id,
+          m.sender_id,
+          m.body,
+          m.created_at,
+          m.read_at,
+          u.username AS sender_username,
+          u.display_name AS sender_display_name
+        FROM messages m
+        JOIN users u ON u.id = m.sender_id
+        WHERE m.id = ?
+      `,
+      args: [Number(insertResult.lastInsertRowid)],
+    });
+
+    const row = messageResult.rows[0];
+
+    res.status(201).json({
+      success: true,
+      message: {
+        id: Number(row.id),
+        conversationId: Number(row.conversation_id),
+        senderId: Number(row.sender_id),
+        senderUsername: row.sender_username,
+        senderDisplayName:
+          row.sender_display_name || row.sender_username,
+        body: row.body,
+        createdAt: row.created_at,
+        readAt: row.read_at || null,
+      },
+    });
+  })
+);
+
+
 // 404 HANDLER
 app.use((req, res) => {
   res.status(404).json({
