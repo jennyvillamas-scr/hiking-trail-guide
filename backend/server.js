@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -90,6 +89,15 @@ const dbReady = (async () => {
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
+
+  const trackColumns = await db.execute("PRAGMA table_info(tracks)");
+
+  if (!trackColumns.rows.some((column) => column.name === "status")) {
+    await db.execute(`
+      ALTER TABLE tracks
+      ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'
+    `);
+  }
 })();
 
 function asyncHandler(handler) {
@@ -146,6 +154,16 @@ function parseTrail(row) {
 }
 
 function parseTrack(row) {
+  if (!row) return null;
+
+  let points = [];
+
+  try {
+    points = JSON.parse(row.points_json);
+  } catch {
+    points = [];
+  }
+
   return {
     id: `track_${row.id}`,
     trailId: row.trail_id,
@@ -155,7 +173,8 @@ function parseTrack(row) {
     durationS: Number(row.duration_s),
     distanceM: Number(row.distance_m),
     ascentM: row.ascent_m == null ? null : Number(row.ascent_m),
-    points: JSON.parse(row.points_json),
+    points,
+    status: row.status || "completed",
     savedAt: row.saved_at,
   };
 }
@@ -196,6 +215,7 @@ app.post(
       !password
     ) {
       return res.status(400).json({
+        success: false,
         message: "Username, email, and password are required.",
       });
     }
@@ -205,12 +225,14 @@ app.post(
 
     if (cleanUsername.length < 6 || cleanUsername.length > 16) {
       return res.status(400).json({
+        success: false,
         message: "Username must be 6–16 characters long.",
       });
     }
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       return res.status(400).json({
+        success: false,
         message: "Please enter a valid email address.",
       });
     }
@@ -220,6 +242,7 @@ app.post(
       Buffer.byteLength(password, "utf8") > 72
     ) {
       return res.status(400).json({
+        success: false,
         message:
           "Password must be at least 8 characters and no more than 72 bytes.",
       });
@@ -234,8 +257,12 @@ app.post(
         args: [cleanUsername, cleanEmail, passwordHash],
       });
     } catch (error) {
-      if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+      if (
+        error.code === "SQLITE_CONSTRAINT_UNIQUE" ||
+        String(error.message).toLowerCase().includes("unique constraint")
+      ) {
         return res.status(409).json({
+          success: false,
           message: "That username or email is already registered.",
         });
       }
@@ -265,6 +292,7 @@ app.post(
       !password
     ) {
       return res.status(400).json({
+        success: false,
         message: "Email and password are required.",
       });
     }
@@ -280,6 +308,7 @@ app.post(
 
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({
+        success: false,
         message: "Incorrect email or password.",
       });
     }
@@ -333,7 +362,7 @@ app.get(
               COALESCE(SUM(distance_m), 0) AS distance_m,
               COALESCE(SUM(ascent_m), 0) AS ascent_m
             FROM tracks
-            WHERE user_id = ?`,
+            WHERE user_id = ? AND status = 'completed'`,
       args: [req.userId],
     });
 
@@ -380,7 +409,8 @@ app.put(
     ) {
       return res.status(400).json({
         success: false,
-        message: "Invalid or oversized profile photo. Please choose a smaller JPEG image.",
+        message:
+          "Invalid or oversized profile photo. Please choose a smaller JPEG image.",
       });
     }
 
@@ -567,7 +597,8 @@ app.get(
 
     const result = await db.execute({
       sql: `SELECT data_json, id, name, region, latitude, longitude, difficulty
-            FROM trails WHERE id = ?`,
+            FROM trails
+            WHERE id = ?`,
       args: [req.params.id],
     });
 
@@ -783,7 +814,15 @@ app.post(
       distanceM,
       ascentM = null,
       points,
+      status = "completed",
     } = req.body || {};
+
+    if (status !== "completed" && status !== "discarded") {
+      return res.status(400).json({
+        success: false,
+        message: "Track status must be completed or discarded.",
+      });
+    }
 
     if (
       typeof startedAt !== "string" ||
@@ -824,8 +863,8 @@ app.post(
     const result = await db.execute({
       sql: `INSERT INTO tracks
             (user_id, trail_id, trail_name, started_at, ended_at,
-             duration_s, distance_m, ascent_m, points_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             duration_s, distance_m, ascent_m, points_json, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         req.userId,
         typeof trailId === "string" ? trailId : null,
@@ -836,6 +875,7 @@ app.post(
         distanceM,
         ascentM,
         JSON.stringify(points),
+        status,
       ],
     });
 
@@ -859,7 +899,10 @@ app.get(
     await dbReady;
 
     const result = await db.execute({
-      sql: "SELECT * FROM tracks WHERE user_id = ? ORDER BY saved_at DESC",
+      sql: `SELECT *
+            FROM tracks
+            WHERE user_id = ?
+            ORDER BY saved_at DESC, id DESC`,
       args: [req.userId],
     });
 
