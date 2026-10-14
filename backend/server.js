@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -60,6 +61,17 @@ const dbReady = (async () => {
       data_json TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
+  `);
+
+  // INDEXES: IMPROVE TRAIL AREA LOOKUPS
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_trails_coordinates
+    ON trails (latitude, longitude)
+  `);
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_trails_region
+    ON trails (region)
   `);
 
   await db.execute(`
@@ -571,6 +583,7 @@ app.patch(
 );
 
 // TRAILS: GET ALL
+// Keep this endpoint for screens that need the complete trail list.
 app.get(
   "/api/trails",
   asyncHandler(async (req, res) => {
@@ -584,6 +597,56 @@ app.get(
 
     res.json({
       success: true,
+      trails: result.rows.map(parseTrail),
+    });
+  })
+);
+
+// TRAILS: GET ONLY THE VISIBLE MAP AREA
+// IMPORTANT: This must be declared before /api/trails/:id.
+app.get(
+  "/api/trails/area",
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const minLat = Number(req.query.minLat);
+    const maxLat = Number(req.query.maxLat);
+    const minLon = Number(req.query.minLon);
+    const maxLon = Number(req.query.maxLon);
+
+    const values = [minLat, maxLat, minLon, maxLon];
+
+    if (
+      values.some((value) => !Number.isFinite(value)) ||
+      minLat < -90 ||
+      maxLat > 90 ||
+      minLat >= maxLat ||
+      minLon < -180 ||
+      maxLon > 180 ||
+      minLon >= maxLon
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid map boundaries.",
+      });
+    }
+
+    const result = await db.execute({
+      sql: `
+        SELECT data_json, id, name, region, latitude,
+               longitude, difficulty
+        FROM trails
+        WHERE latitude BETWEEN ? AND ?
+          AND longitude BETWEEN ? AND ?
+        ORDER BY name COLLATE NOCASE
+        LIMIT 300
+      `,
+      args: [minLat, maxLat, minLon, maxLon],
+    });
+
+    res.json({
+      success: true,
+      count: result.rows.length,
       trails: result.rows.map(parseTrail),
     });
   })
