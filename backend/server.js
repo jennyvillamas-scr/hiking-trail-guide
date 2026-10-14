@@ -27,6 +27,38 @@ const dbReady = (async () => {
     throw new Error("Missing required environment variables.");
   }
 
+    await db.execute(`
+    CREATE TABLE IF NOT EXISTS trails (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      region TEXT,
+      latitude REAL,
+      longitude REAL,
+      difficulty TEXT,
+      data_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trail_id TEXT NOT NULL,
+      user_id INTEGER NOT NULL,
+      rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      comment TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (trail_id) REFERENCES trails(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_reviews_trail_created
+    ON reviews (trail_id, created_at)
+  `);
+
   await db.execute(`
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,24 +84,6 @@ const dbReady = (async () => {
       "ALTER TABLE users ADD COLUMN profile_photo TEXT"
     );
   }
-
-  await db.execute(`
-    CREATE TABLE IF NOT EXISTS trails (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      region TEXT,
-      latitude REAL,
-      longitude REAL,
-      difficulty TEXT,
-      data_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await db.execute(`
-    CREATE INDEX IF NOT EXISTS idx_trails_coordinates
-    ON trails (latitude, longitude)
-  `);
 
   await db.execute(`
     CREATE INDEX IF NOT EXISTS idx_trails_region
@@ -982,25 +996,6 @@ app.post(
     });
   })
 );
-
-await db.execute(`
-  CREATE TABLE IF NOT EXISTS reviews (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    trail_id TEXT NOT NULL,
-    user_id INTEGER NOT NULL,
-    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-    comment TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (trail_id) REFERENCES trails(id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-  )
-`);
-
-await db.execute(`
-  CREATE INDEX IF NOT EXISTS idx_reviews_trail_created
-  ON reviews(trail_id, created_at)
-`);
-
 /* FAVORITES */
 
 app.get(
