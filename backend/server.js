@@ -688,26 +688,17 @@ app.get(
       SELECT data_json, id, name, region, latitude, longitude, difficulty
       FROM trails
       ORDER BY name COLLATE NOCASE
+      LIMIT 10000
     `);
 
-    const allTrails = result.rows.map(parseTrail).filter(Boolean);
-
-    const trails = allTrails.filter(
-      (trail) =>
-        trail.latitude !== null &&
-        trail.longitude !== null &&
-        Number.isFinite(trail.latitude) &&
-        Number.isFinite(trail.longitude) &&
-        trail.latitude >= -90 &&
-        trail.latitude <= 90 &&
-        trail.longitude >= -180 &&
-        trail.longitude <= 180
-    );
-
-    console.log("All trails requested:", {
-      databaseRecords: allTrails.length,
-      validTrails: trails.length,
-    });
+    const trails = result.rows
+      .map(parseTrail)
+      .filter(
+        (trail) =>
+          trail &&
+          trail.latitude !== null &&
+          trail.longitude !== null
+      );
 
     res.json({
       success: true,
