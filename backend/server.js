@@ -794,6 +794,9 @@ app.get(
 
 /* SYNCHRONIZE TRAILS INTO TURSO */
 
+
+/* SYNCHRONIZE OR REPLACE TRAILS IN TURSO */
+
 app.post(
   "/api/admin/trails/sync",
   asyncHandler(async (req, res) => {
@@ -823,11 +826,19 @@ app.post(
     }
 
     const trails = req.body?.trails;
+    const replace = req.body?.replace === true;
 
     if (!Array.isArray(trails)) {
       return res.status(400).json({
         success: false,
         message: "Send a trails array.",
+      });
+    }
+
+    if (trails.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "The trails array cannot be empty.",
       });
     }
 
@@ -838,7 +849,8 @@ app.post(
       });
     }
 
-    const statements = [];
+    const preparedTrails = [];
+    const seenIds = new Set();
 
     for (const trail of trails) {
       if (
@@ -861,6 +873,15 @@ app.post(
         name: trail.name.trim(),
       };
 
+      if (seenIds.has(data.id)) {
+        return res.status(400).json({
+          success: false,
+          message: `Duplicate trail ID: ${data.id}.`,
+        });
+      }
+
+      seenIds.add(data.id);
+
       const latitude = numberOrNull(
         data.latitude ?? data.lat
       );
@@ -870,28 +891,51 @@ app.post(
       );
 
       if (
-        latitude !== null &&
-        (latitude < -90 || latitude > 90)
+        latitude === null ||
+        longitude === null ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180
       ) {
         return res.status(400).json({
           success: false,
-          message: `Invalid latitude for trail ${data.id}.`,
-        });
-      }
-
-      if (
-        longitude !== null &&
-        (longitude < -180 || longitude > 180)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid longitude for trail ${data.id}.`,
+          message: `Invalid coordinates for trail ${data.id}.`,
         });
       }
 
       data.latitude = latitude;
       data.longitude = longitude;
 
+      preparedTrails.push(data);
+    }
+
+    const statements = [];
+
+    if (replace) {
+      const ids = preparedTrails.map((trail) => trail.id);
+      const placeholders = ids.map(() => "?").join(", ");
+
+      // Remove favorites for trails that will no longer exist.
+      statements.push({
+        sql: `
+          DELETE FROM favorites
+          WHERE trail_id NOT IN (${placeholders})
+        `,
+        args: ids,
+      });
+
+      // Remove all old trails not included in the new list.
+      statements.push({
+        sql: `
+          DELETE FROM trails
+          WHERE id NOT IN (${placeholders})
+        `,
+        args: ids,
+      });
+    }
+
+    for (const data of preparedTrails) {
       statements.push({
         sql: `
           INSERT INTO trails (
@@ -912,25 +956,33 @@ app.post(
           data.id,
           data.name,
           data.region ?? null,
-          latitude,
-          longitude,
+          data.latitude,
+          data.longitude,
           data.difficulty ?? null,
           JSON.stringify(data),
         ],
       });
     }
 
-    if (statements.length) {
-      await db.batch(statements, "write");
-    }
+    // Turso/libSQL executes the batch as a transaction.
+    await db.batch(statements, "write");
+
+    const result = await db.execute(
+      "SELECT COUNT(*) AS count FROM trails"
+    );
 
     res.json({
       success: true,
-      message: "Trails synchronized successfully.",
-      count: statements.length,
+      message: replace
+        ? "Trail database replaced successfully."
+        : "Trails synchronized successfully.",
+      replaced: replace,
+      received: preparedTrails.length,
+      totalInDatabase: Number(result.rows[0]?.count || 0),
     });
   })
 );
+
 
 /* FAVORITES */
 
