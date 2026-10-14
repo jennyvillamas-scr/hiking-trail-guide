@@ -5,15 +5,19 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const db = require("./db");
 
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const TRAIL_SYNC_SECRET = process.env.TRAIL_SYNC_SECRET;
+
+const MAX_PROFILE_PHOTO_LENGTH = 6_000_000;
+const PROFILE_PHOTO_PREFIX = "data:image/jpeg;base64,";
 
 const dbReady = (async () => {
   if (
@@ -34,11 +38,16 @@ const dbReady = (async () => {
     )
   `);
 
-  // Add display_name to existing user databases if it is missing.
-  const userColumns = await db.execute("PRAGMA table_info(users)");
+  let userColumns = await db.execute("PRAGMA table_info(users)");
 
   if (!userColumns.rows.some((column) => column.name === "display_name")) {
     await db.execute("ALTER TABLE users ADD COLUMN display_name TEXT");
+  }
+
+  userColumns = await db.execute("PRAGMA table_info(users)");
+
+  if (!userColumns.rows.some((column) => column.name === "profile_photo")) {
+    await db.execute("ALTER TABLE users ADD COLUMN profile_photo TEXT");
   }
 
   await db.execute(`
@@ -302,7 +311,8 @@ app.get(
     await dbReady;
 
     const result = await db.execute({
-      sql: `SELECT id, username, email, display_name, created_at
+      sql: `SELECT id, username, email, display_name,
+                   profile_photo, created_at
             FROM users
             WHERE id = ?`,
       args: [req.userId],
@@ -341,6 +351,7 @@ app.get(
         username: user.username,
         displayName: user.display_name || user.username,
         email: user.email,
+        profilePhoto: user.profile_photo || null,
         createdAt: user.created_at,
         stats: {
           hikes: Number(hikeStats.hike_count),
@@ -349,6 +360,97 @@ app.get(
           savedTrails: Number(favorites.rows[0].count),
         },
       },
+    });
+  })
+);
+
+// PROFILE: SAVE PHOTO
+app.put(
+  "/api/profile/photo",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const { profilePhoto } = req.body || {};
+
+    if (
+      typeof profilePhoto !== "string" ||
+      !profilePhoto.startsWith(PROFILE_PHOTO_PREFIX) ||
+      profilePhoto.length > MAX_PROFILE_PHOTO_LENGTH
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or oversized profile photo. Please choose a smaller JPEG image.",
+      });
+    }
+
+    const base64Data = profilePhoto.slice(PROFILE_PHOTO_PREFIX.length);
+
+    if (
+      !base64Data ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "The selected profile photo is invalid.",
+      });
+    }
+
+    const imageBuffer = Buffer.from(base64Data, "base64");
+
+    if (
+      imageBuffer.length === 0 ||
+      imageBuffer.length > 4_400_000 ||
+      imageBuffer.toString("base64") !== base64Data
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "The image data is invalid or too large.",
+      });
+    }
+
+    const result = await db.execute({
+      sql: "UPDATE users SET profile_photo = ? WHERE id = ?",
+      args: [profilePhoto, req.userId],
+    });
+
+    if (Number(result.rowsAffected) === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User account not found.",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Profile photo saved successfully.",
+      profilePhoto,
+    });
+  })
+);
+
+// PROFILE: REMOVE PHOTO
+app.delete(
+  "/api/profile/photo",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const result = await db.execute({
+      sql: "UPDATE users SET profile_photo = NULL WHERE id = ?",
+      args: [req.userId],
+    });
+
+    if (Number(result.rowsAffected) === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User account not found.",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Profile photo removed successfully.",
     });
   })
 );
@@ -414,7 +516,8 @@ app.patch(
     }
 
     const result = await db.execute({
-      sql: `SELECT id, username, email, display_name, created_at
+      sql: `SELECT id, username, email, display_name,
+                   profile_photo, created_at
             FROM users
             WHERE id = ?`,
       args: [req.userId],
@@ -430,6 +533,7 @@ app.patch(
         username: user.username,
         displayName: user.display_name || user.username,
         email: user.email,
+        profilePhoto: user.profile_photo || null,
         createdAt: user.created_at,
       },
     });
@@ -499,7 +603,7 @@ app.post(
     if (
       typeof suppliedSecret !== "string" ||
       suppliedSecret.length !== TRAIL_SYNC_SECRET.length ||
-      !require("crypto").timingSafeEqual(
+      !crypto.timingSafeEqual(
         Buffer.from(suppliedSecret),
         Buffer.from(TRAIL_SYNC_SECRET)
       )
