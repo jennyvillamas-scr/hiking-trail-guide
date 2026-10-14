@@ -976,7 +976,6 @@ app.delete(
   })
 );
 
-
 /* ================================
    CHAT: FIND USERS
 ================================ */
@@ -993,7 +992,11 @@ app.get(
 
     const result = await db.execute({
       sql: `
-        SELECT id, username, display_name
+        SELECT
+          id,
+          username,
+          display_name,
+          profile_photo
         FROM users
         WHERE id != ?
           AND (
@@ -1018,6 +1021,7 @@ app.get(
         id: Number(user.id),
         username: user.username,
         displayName: user.display_name || user.username,
+        profilePhoto: user.profile_photo || null,
       })),
     });
   })
@@ -1040,6 +1044,7 @@ app.get(
           u.id AS other_user_id,
           u.username AS other_username,
           u.display_name AS other_display_name,
+          u.profile_photo AS other_profile_photo,
           (
             SELECT m.body
             FROM messages m
@@ -1097,6 +1102,7 @@ app.get(
           username: row.other_username,
           displayName:
             row.other_display_name || row.other_username,
+          profilePhoto: row.other_profile_photo || null,
         },
         lastMessage: row.last_message || null,
         lastMessageAt: row.last_message_at || null,
@@ -1136,7 +1142,11 @@ app.post(
 
     const userResult = await db.execute({
       sql: `
-        SELECT id, username, display_name
+        SELECT
+          id,
+          username,
+          display_name,
+          profile_photo
         FROM users
         WHERE id = ?
       `,
@@ -1184,6 +1194,7 @@ app.post(
           username: otherUser.username,
           displayName:
             otherUser.display_name || otherUser.username,
+          profilePhoto: otherUser.profile_photo || null,
         },
       },
     });
@@ -1378,7 +1389,6 @@ app.post(
     });
   })
 );
-
 
 // 404 HANDLER
 app.use((req, res) => {
