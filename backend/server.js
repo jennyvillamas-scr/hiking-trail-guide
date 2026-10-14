@@ -15,7 +15,6 @@ app.use(express.json({ limit: "8mb" }));
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const TRAIL_SYNC_SECRET = process.env.TRAIL_SYNC_SECRET;
-
 const MAX_PROFILE_PHOTO_LENGTH = 6_000_000;
 const PROFILE_PHOTO_PREFIX = "data:image/jpeg;base64,";
 
@@ -38,16 +37,20 @@ const dbReady = (async () => {
     )
   `);
 
-  let userColumns = await db.execute("PRAGMA table_info(users)");
+  let columns = await db.execute("PRAGMA table_info(users)");
 
-  if (!userColumns.rows.some((column) => column.name === "display_name")) {
-    await db.execute("ALTER TABLE users ADD COLUMN display_name TEXT");
+  if (!columns.rows.some((column) => column.name === "display_name")) {
+    await db.execute(
+      "ALTER TABLE users ADD COLUMN display_name TEXT"
+    );
   }
 
-  userColumns = await db.execute("PRAGMA table_info(users)");
+  columns = await db.execute("PRAGMA table_info(users)");
 
-  if (!userColumns.rows.some((column) => column.name === "profile_photo")) {
-    await db.execute("ALTER TABLE users ADD COLUMN profile_photo TEXT");
+  if (!columns.rows.some((column) => column.name === "profile_photo")) {
+    await db.execute(
+      "ALTER TABLE users ADD COLUMN profile_photo TEXT"
+    );
   }
 
   await db.execute(`
@@ -90,25 +93,81 @@ const dbReady = (async () => {
       user_id INTEGER NOT NULL,
       trail_id TEXT,
       trail_name TEXT,
-      started_at TEXT NOT NULL,
-      ended_at TEXT NOT NULL,
+      started_at TEXT NOT NULL DEFAULT '',
+      ended_at TEXT NOT NULL DEFAULT '',
       duration_s REAL NOT NULL DEFAULT 0,
       distance_m REAL NOT NULL DEFAULT 0,
       ascent_m REAL,
-      points_json TEXT NOT NULL,
+      points_json TEXT NOT NULL DEFAULT '[]',
       saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      status TEXT NOT NULL DEFAULT 'completed',
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )
   `);
 
-  const trackColumns = await db.execute("PRAGMA table_info(tracks)");
+  const trackColumnsToAdd = [
+    ["user_id", "INTEGER NOT NULL DEFAULT 0"],
+    ["trail_id", "TEXT"],
+    ["trail_name", "TEXT"],
+    ["started_at", "TEXT NOT NULL DEFAULT ''"],
+    ["ended_at", "TEXT NOT NULL DEFAULT ''"],
+    ["duration_s", "REAL NOT NULL DEFAULT 0"],
+    ["distance_m", "REAL NOT NULL DEFAULT 0"],
+    ["ascent_m", "REAL"],
+    ["points_json", "TEXT NOT NULL DEFAULT '[]'"],
+    ["saved_at", "TEXT"],
+    ["status", "TEXT NOT NULL DEFAULT 'completed'"],
+  ];
 
-  if (!trackColumns.rows.some((column) => column.name === "status")) {
-    await db.execute(`
-      ALTER TABLE tracks
-      ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'
-    `);
+  let trackColumns = await db.execute("PRAGMA table_info(tracks)");
+
+  for (const [name, definition] of trackColumnsToAdd) {
+    if (!trackColumns.rows.some((column) => column.name === name)) {
+      await db.execute(
+        `ALTER TABLE tracks ADD COLUMN ${name} ${definition}`
+      );
+
+      trackColumns = await db.execute("PRAGMA table_info(tracks)");
+    }
   }
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_tracks_user_saved
+    ON tracks (user_id, saved_at)
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_one_id INTEGER NOT NULL,
+      user_two_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (user_one_id, user_two_id),
+      FOREIGN KEY (user_one_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_two_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      conversation_id INTEGER NOT NULL,
+      sender_id INTEGER NOT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      read_at TEXT,
+      FOREIGN KEY (conversation_id)
+        REFERENCES conversations(id) ON DELETE CASCADE,
+      FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  await db.execute(`
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages (conversation_id, id)
+  `);
+
+  console.log("Database initialization completed.");
 })();
 
 function asyncHandler(handler) {
@@ -130,7 +189,10 @@ function requireAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, JWT_SECRET);
 
-    if (!payload.userId) {
+    if (
+      !payload.userId ||
+      !Number.isFinite(Number(payload.userId))
+    ) {
       return res.status(401).json({
         success: false,
         message: "Invalid authentication token.",
@@ -147,61 +209,46 @@ function requireAuth(req, res, next) {
   }
 }
 
-// FIXED: Preserve trail data and ensure database coordinates are included.
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function parseTrail(row) {
   if (!row) return null;
 
   let data = {};
 
   try {
-    const parsed = JSON.parse(row.data_json);
+    const parsed = JSON.parse(row.data_json || "{}");
 
-    if (
-      parsed &&
-      typeof parsed === "object" &&
-      !Array.isArray(parsed)
-    ) {
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       data = parsed;
     }
-  } catch {
-    // Use database columns when data_json is invalid.
-  }
+  } catch {}
 
-  const latitudeValue =
-    data.latitude ??
-    data.lat ??
-    row.latitude;
+  const latitude = numberOrNull(
+    data.latitude ?? data.lat ?? row.latitude
+  );
 
-  const longitudeValue =
-    data.longitude ??
-    data.lng ??
-    data.lon ??
-    row.longitude;
-
-  const latitude =
-    latitudeValue !== null &&
-    latitudeValue !== undefined &&
-    latitudeValue !== "" &&
-    Number.isFinite(Number(latitudeValue))
-      ? Number(latitudeValue)
-      : null;
-
-  const longitude =
-    longitudeValue !== null &&
-    longitudeValue !== undefined &&
-    longitudeValue !== "" &&
-    Number.isFinite(Number(longitudeValue))
-      ? Number(longitudeValue)
-      : null;
+  const longitude = numberOrNull(
+    data.longitude ?? data.lng ?? data.lon ?? row.longitude
+  );
 
   return {
     ...data,
-    id: data.id ?? row.id,
-    name: data.name ?? row.name,
-    region: data.region ?? row.region,
+    id: String(data.id ?? row.id),
+    name: data.name ?? row.name ?? "Unnamed trail",
+    region: data.region ?? row.region ?? "Unknown region",
     latitude,
     longitude,
-    difficulty: data.difficulty ?? row.difficulty,
+    lat: latitude,
+    lng: longitude,
+    difficulty: data.difficulty ?? row.difficulty ?? "Unknown",
   };
 }
 
@@ -211,52 +258,59 @@ function parseTrack(row) {
   let points = [];
 
   try {
-    points = JSON.parse(row.points_json);
-  } catch {
-    points = [];
-  }
+    const parsed = JSON.parse(row.points_json || "[]");
+
+    if (Array.isArray(parsed)) {
+      points = parsed;
+    }
+  } catch {}
 
   return {
     id: `track_${row.id}`,
-    trailId: row.trail_id,
-    trailName: row.trail_name,
+    trailId: row.trail_id ?? null,
+    trailName: row.trail_name ?? null,
     startedAt: row.started_at,
     endedAt: row.ended_at,
-    durationS: Number(row.duration_s),
-    distanceM: Number(row.distance_m),
-    ascentM: row.ascent_m == null ? null : Number(row.ascent_m),
+    durationS: Number(row.duration_s || 0),
+    distanceM: Number(row.distance_m || 0),
+    ascentM:
+      row.ascent_m == null ? null : Number(row.ascent_m),
     points,
-    status: row.status || "completed",
-    savedAt: row.saved_at,
+    status: row.status === "discarded" ? "discarded" : "completed",
+    savedAt: row.saved_at || row.started_at || null,
+    synced: true,
   };
 }
 
 function getTrackDatabaseId(id) {
-  const match = /^track_(\d+)$/.exec(String(id));
+  const match = /^(?:track_)?(\d+)$/.exec(String(id));
   return match ? Number(match[1]) : null;
 }
 
-// HEALTH CHECK
 app.get(
   "/api/health",
   asyncHandler(async (req, res) => {
     await dbReady;
     await db.execute("SELECT 1");
 
+    const result = await db.execute(
+      "SELECT COUNT(*) AS count FROM trails"
+    );
+
     res.json({
       success: true,
       message: "API and database are connected.",
+      trailCount: Number(result.rows[0]?.count || 0),
     });
   })
 );
 
-// AUTH: REGISTER
 app.post(
   "/api/auth/register",
   asyncHandler(async (req, res) => {
     await dbReady;
 
-    const { username, email, password } = req.body;
+    const { username, email, password } = req.body || {};
 
     if (
       typeof username !== "string" ||
@@ -295,8 +349,7 @@ app.post(
     ) {
       return res.status(400).json({
         success: false,
-        message:
-          "Password must be at least 8 characters and no more than 72 bytes.",
+        message: "Password must be at least 8 characters and no more than 72 bytes.",
       });
     }
 
@@ -304,8 +357,10 @@ app.post(
 
     try {
       await db.execute({
-        sql: `INSERT INTO users (username, email, password_hash)
-              VALUES (?, ?, ?)`,
+        sql: `
+          INSERT INTO users (username, email, password_hash)
+          VALUES (?, ?, ?)
+        `,
         args: [cleanUsername, cleanEmail, passwordHash],
       });
     } catch (error) {
@@ -329,13 +384,12 @@ app.post(
   })
 );
 
-// AUTH: LOGIN
 app.post(
   "/api/auth/login",
   asyncHandler(async (req, res) => {
     await dbReady;
 
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
     if (
       typeof email !== "string" ||
@@ -350,9 +404,11 @@ app.post(
     }
 
     const result = await db.execute({
-      sql: `SELECT id, username, email, password_hash
-            FROM users
-            WHERE email = ? COLLATE NOCASE`,
+      sql: `
+        SELECT id, username, email, password_hash
+        FROM users
+        WHERE email = ? COLLATE NOCASE
+      `,
       args: [email.trim()],
     });
 
@@ -384,7 +440,6 @@ app.post(
   })
 );
 
-// PROFILE: GET CURRENT USER
 app.get(
   "/api/profile",
   requireAuth,
@@ -392,10 +447,11 @@ app.get(
     await dbReady;
 
     const result = await db.execute({
-      sql: `SELECT id, username, email, display_name,
-                   profile_photo, created_at
-            FROM users
-            WHERE id = ?`,
+      sql: `
+        SELECT id, username, email, display_name, profile_photo, created_at
+        FROM users
+        WHERE id = ?
+      `,
       args: [req.userId],
     });
 
@@ -409,12 +465,14 @@ app.get(
     const user = result.rows[0];
 
     const stats = await db.execute({
-      sql: `SELECT
-              COUNT(*) AS hike_count,
-              COALESCE(SUM(distance_m), 0) AS distance_m,
-              COALESCE(SUM(ascent_m), 0) AS ascent_m
-            FROM tracks
-            WHERE user_id = ? AND status = 'completed'`,
+      sql: `
+        SELECT
+          COUNT(*) AS hike_count,
+          COALESCE(SUM(distance_m), 0) AS distance_m,
+          COALESCE(SUM(ascent_m), 0) AS ascent_m
+        FROM tracks
+        WHERE user_id = ? AND status = 'completed'
+      `,
       args: [req.userId],
     });
 
@@ -423,7 +481,7 @@ app.get(
       args: [req.userId],
     });
 
-    const hikeStats = stats.rows[0];
+    const s = stats.rows[0];
 
     res.json({
       success: true,
@@ -435,9 +493,9 @@ app.get(
         profilePhoto: user.profile_photo || null,
         createdAt: user.created_at,
         stats: {
-          hikes: Number(hikeStats.hike_count),
-          distanceKm: Number(hikeStats.distance_m) / 1000,
-          elevationM: Number(hikeStats.ascent_m),
+          hikes: Number(s.hike_count),
+          distanceKm: Number(s.distance_m) / 1000,
+          elevationM: Number(s.ascent_m),
           savedTrails: Number(favorites.rows[0].count),
         },
       },
@@ -445,7 +503,6 @@ app.get(
   })
 );
 
-// PROFILE: SAVE PHOTO
 app.put(
   "/api/profile/photo",
   requireAuth,
@@ -461,17 +518,15 @@ app.put(
     ) {
       return res.status(400).json({
         success: false,
-        message:
-          "Invalid or oversized profile photo. Please choose a smaller JPEG image.",
+        message: "Invalid or oversized profile photo. Please choose a smaller JPEG image.",
       });
     }
 
-    const base64Data = profilePhoto.slice(PROFILE_PHOTO_PREFIX.length);
+    const base64Data = profilePhoto.slice(
+      PROFILE_PHOTO_PREFIX.length
+    );
 
-    if (
-      !base64Data ||
-      !/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)
-    ) {
+    if (!base64Data || !/^[A-Za-z0-9+/]*={0,2}$/.test(base64Data)) {
       return res.status(400).json({
         success: false,
         message: "The selected profile photo is invalid.",
@@ -481,7 +536,7 @@ app.put(
     const imageBuffer = Buffer.from(base64Data, "base64");
 
     if (
-      imageBuffer.length === 0 ||
+      !imageBuffer.length ||
       imageBuffer.length > 4_400_000 ||
       imageBuffer.toString("base64") !== base64Data
     ) {
@@ -496,7 +551,7 @@ app.put(
       args: [profilePhoto, req.userId],
     });
 
-    if (Number(result.rowsAffected) === 0) {
+    if (!Number(result.rowsAffected)) {
       return res.status(404).json({
         success: false,
         message: "User account not found.",
@@ -511,7 +566,6 @@ app.put(
   })
 );
 
-// PROFILE: REMOVE PHOTO
 app.delete(
   "/api/profile/photo",
   requireAuth,
@@ -523,7 +577,7 @@ app.delete(
       args: [req.userId],
     });
 
-    if (Number(result.rowsAffected) === 0) {
+    if (!Number(result.rowsAffected)) {
       return res.status(404).json({
         success: false,
         message: "User account not found.",
@@ -537,7 +591,6 @@ app.delete(
   })
 );
 
-// PROFILE: UPDATE CURRENT USER
 app.patch(
   "/api/profile",
   requireAuth,
@@ -571,16 +624,17 @@ app.patch(
     if (!/^[a-zA-Z0-9_]{6,16}$/.test(cleanUsername)) {
       return res.status(400).json({
         success: false,
-        message:
-          "Username must be 6–16 characters and use only letters, numbers, or underscores.",
+        message: "Username must be 6–16 characters and use only letters, numbers, or underscores.",
       });
     }
 
     try {
       await db.execute({
-        sql: `UPDATE users
-              SET display_name = ?, username = ?
-              WHERE id = ?`,
+        sql: `
+          UPDATE users
+          SET display_name = ?, username = ?
+          WHERE id = ?
+        `,
         args: [cleanDisplayName, cleanUsername, req.userId],
       });
     } catch (error) {
@@ -598,10 +652,11 @@ app.patch(
     }
 
     const result = await db.execute({
-      sql: `SELECT id, username, email, display_name,
-                   profile_photo, created_at
-            FROM users
-            WHERE id = ?`,
+      sql: `
+        SELECT id, username, email, display_name, profile_photo, created_at
+        FROM users
+        WHERE id = ?
+      `,
       args: [req.userId],
     });
 
@@ -622,7 +677,8 @@ app.patch(
   })
 );
 
-// TRAILS: GET ALL
+/* TRAILS */
+
 app.get(
   "/api/trails",
   asyncHandler(async (req, res) => {
@@ -632,17 +688,26 @@ app.get(
       SELECT data_json, id, name, region, latitude, longitude, difficulty
       FROM trails
       ORDER BY name COLLATE NOCASE
+      LIMIT 10000
     `);
+
+    const trails = result.rows
+      .map(parseTrail)
+      .filter(
+        (trail) =>
+          trail &&
+          trail.latitude !== null &&
+          trail.longitude !== null
+      );
 
     res.json({
       success: true,
-      trails: result.rows.map(parseTrail),
+      count: trails.length,
+      trails,
     });
   })
 );
 
-// TRAILS: GET ONLY THE VISIBLE MAP AREA
-// This must be declared before /api/trails/:id.
 app.get(
   "/api/trails/area",
   asyncHandler(async (req, res) => {
@@ -672,35 +737,44 @@ app.get(
 
     const result = await db.execute({
       sql: `
-        SELECT data_json, id, name, region, latitude,
-               longitude, difficulty
+        SELECT data_json, id, name, region, latitude, longitude, difficulty
         FROM trails
         WHERE latitude BETWEEN ? AND ?
           AND longitude BETWEEN ? AND ?
         ORDER BY name COLLATE NOCASE
-        LIMIT 300
+        LIMIT 1000
       `,
       args: [minLat, maxLat, minLon, maxLon],
     });
 
+    const trails = result.rows
+      .map(parseTrail)
+      .filter(
+        (trail) =>
+          trail &&
+          trail.latitude !== null &&
+          trail.longitude !== null
+      );
+
     res.json({
       success: true,
-      count: result.rows.length,
-      trails: result.rows.map(parseTrail),
+      count: trails.length,
+      trails,
     });
   })
 );
 
-// TRAILS: GET ONE
 app.get(
   "/api/trails/:id",
   asyncHandler(async (req, res) => {
     await dbReady;
 
     const result = await db.execute({
-      sql: `SELECT data_json, id, name, region, latitude, longitude, difficulty
-            FROM trails
-            WHERE id = ?`,
+      sql: `
+        SELECT data_json, id, name, region, latitude, longitude, difficulty
+        FROM trails
+        WHERE id = ?
+      `,
       args: [req.params.id],
     });
 
@@ -718,7 +792,8 @@ app.get(
   })
 );
 
-// TRAILS: SECURE BULK SYNC
+/* SYNCHRONIZE TRAILS INTO TURSO */
+
 app.post(
   "/api/admin/trails/sync",
   asyncHandler(async (req, res) => {
@@ -768,41 +843,77 @@ app.post(
     for (const trail of trails) {
       if (
         !trail ||
-        typeof trail.id !== "string" ||
-        !trail.id.trim() ||
+        (typeof trail.id !== "string" &&
+          typeof trail.id !== "number") ||
+        !String(trail.id).trim() ||
         typeof trail.name !== "string" ||
         !trail.name.trim()
       ) {
         return res.status(400).json({
           success: false,
-          message: "Every trail needs a string id and name.",
+          message: "Every trail needs an id and name.",
         });
       }
 
-      const data = { ...trail, id: trail.id.trim() };
+      const data = {
+        ...trail,
+        id: String(trail.id).trim(),
+        name: trail.name.trim(),
+      };
+
+      const latitude = numberOrNull(
+        data.latitude ?? data.lat
+      );
+
+      const longitude = numberOrNull(
+        data.longitude ?? data.lng ?? data.lon
+      );
+
+      if (
+        latitude !== null &&
+        (latitude < -90 || latitude > 90)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid latitude for trail ${data.id}.`,
+        });
+      }
+
+      if (
+        longitude !== null &&
+        (longitude < -180 || longitude > 180)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid longitude for trail ${data.id}.`,
+        });
+      }
+
+      data.latitude = latitude;
+      data.longitude = longitude;
 
       statements.push({
-        sql: `INSERT INTO trails
-              (id, name, region, latitude, longitude, difficulty, data_json, updated_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-              ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                region = excluded.region,
-                latitude = excluded.latitude,
-                longitude = excluded.longitude,
-                difficulty = excluded.difficulty,
-                data_json = excluded.data_json,
-                updated_at = CURRENT_TIMESTAMP`,
+        sql: `
+          INSERT INTO trails (
+            id, name, region, latitude, longitude,
+            difficulty, data_json, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+          ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            region = excluded.region,
+            latitude = excluded.latitude,
+            longitude = excluded.longitude,
+            difficulty = excluded.difficulty,
+            data_json = excluded.data_json,
+            updated_at = CURRENT_TIMESTAMP
+        `,
         args: [
           data.id,
-          data.name.trim(),
+          data.name,
           data.region ?? null,
-          Number.isFinite(Number(data.latitude))
-            ? Number(data.latitude)
-            : null,
-          Number.isFinite(Number(data.longitude))
-            ? Number(data.longitude)
-            : null,
+          latitude,
+          longitude,
           data.difficulty ?? null,
           JSON.stringify(data),
         ],
@@ -821,7 +932,8 @@ app.post(
   })
 );
 
-// FAVORITES: LIST
+/* FAVORITES */
+
 app.get(
   "/api/favorites",
   requireAuth,
@@ -829,12 +941,16 @@ app.get(
     await dbReady;
 
     const result = await db.execute({
-      sql: `SELECT t.data_json, t.id, t.name, t.region, t.latitude,
-                   t.longitude, t.difficulty, f.created_at
-            FROM favorites f
-            JOIN trails t ON t.id = f.trail_id
-            WHERE f.user_id = ?
-            ORDER BY f.created_at DESC`,
+      sql: `
+        SELECT
+          t.data_json, t.id, t.name, t.region,
+          t.latitude, t.longitude, t.difficulty,
+          f.created_at
+        FROM favorites f
+        JOIN trails t ON t.id = f.trail_id
+        WHERE f.user_id = ?
+        ORDER BY f.created_at DESC
+      `,
       args: [req.userId],
     });
 
@@ -848,7 +964,6 @@ app.get(
   })
 );
 
-// FAVORITES: ADD
 app.post(
   "/api/favorites/:trailId",
   requireAuth,
@@ -868,9 +983,11 @@ app.post(
     }
 
     await db.execute({
-      sql: `INSERT INTO favorites (user_id, trail_id)
-            VALUES (?, ?)
-            ON CONFLICT(user_id, trail_id) DO NOTHING`,
+      sql: `
+        INSERT INTO favorites (user_id, trail_id)
+        VALUES (?, ?)
+        ON CONFLICT(user_id, trail_id) DO NOTHING
+      `,
       args: [req.userId, req.params.trailId],
     });
 
@@ -881,7 +998,6 @@ app.post(
   })
 );
 
-// FAVORITES: REMOVE
 app.delete(
   "/api/favorites/:trailId",
   requireAuth,
@@ -889,7 +1005,10 @@ app.delete(
     await dbReady;
 
     await db.execute({
-      sql: "DELETE FROM favorites WHERE user_id = ? AND trail_id = ?",
+      sql: `
+        DELETE FROM favorites
+        WHERE user_id = ? AND trail_id = ?
+      `,
       args: [req.userId, req.params.trailId],
     });
 
@@ -900,31 +1019,32 @@ app.delete(
   })
 );
 
-// TRACKS: SAVE
+/* HIKING HISTORY */
+
 app.post(
   "/api/tracks",
   requireAuth,
   asyncHandler(async (req, res) => {
     await dbReady;
 
-    const {
-      trailId = null,
-      trailName = null,
-      startedAt,
-      endedAt,
-      durationS,
-      distanceM,
-      ascentM = null,
-      points,
-      status = "completed",
-    } = req.body || {};
+    const body = req.body || {};
 
-    if (status !== "completed" && status !== "discarded") {
-      return res.status(400).json({
-        success: false,
-        message: "Track status must be completed or discarded.",
-      });
-    }
+    const trailId =
+      body.trailId == null ? null : String(body.trailId);
+
+    const trailName =
+      body.trailName == null ? null : String(body.trailName);
+
+    const startedAt = body.startedAt;
+    const endedAt = body.endedAt;
+    const durationS = Number(body.durationS);
+    const distanceM = Number(body.distanceM);
+    const ascentM =
+      body.ascentM == null ? null : Number(body.ascentM);
+
+    const points = body.points;
+    const status =
+      body.status === "discarded" ? "discarded" : "completed";
 
     if (
       typeof startedAt !== "string" ||
@@ -946,14 +1066,21 @@ app.post(
     }
 
     for (const point of points) {
+      const latitude = Number(
+        point?.latitude ?? point?.lat
+      );
+
+      const longitude = Number(
+        point?.longitude ?? point?.lng ?? point?.lon
+      );
+
       if (
-        !point ||
-        !Number.isFinite(point.latitude) ||
-        !Number.isFinite(point.longitude) ||
-        point.latitude < -90 ||
-        point.latitude > 90 ||
-        point.longitude < -180 ||
-        point.longitude > 180
+        !Number.isFinite(latitude) ||
+        !Number.isFinite(longitude) ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180
       ) {
         return res.status(400).json({
           success: false,
@@ -963,14 +1090,17 @@ app.post(
     }
 
     const result = await db.execute({
-      sql: `INSERT INTO tracks
-            (user_id, trail_id, trail_name, started_at, ended_at,
-             duration_s, distance_m, ascent_m, points_json, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      sql: `
+        INSERT INTO tracks (
+          user_id, trail_id, trail_name, started_at, ended_at,
+          duration_s, distance_m, ascent_m, points_json, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
       args: [
         req.userId,
-        typeof trailId === "string" ? trailId : null,
-        typeof trailName === "string" ? trailName : null,
+        trailId,
+        trailName,
         startedAt,
         endedAt,
         durationS,
@@ -982,7 +1112,11 @@ app.post(
     });
 
     const saved = await db.execute({
-      sql: "SELECT * FROM tracks WHERE id = ? AND user_id = ?",
+      sql: `
+        SELECT *
+        FROM tracks
+        WHERE id = ? AND user_id = ?
+      `,
       args: [Number(result.lastInsertRowid), req.userId],
     });
 
@@ -993,7 +1127,6 @@ app.post(
   })
 );
 
-// TRACKS: LIST
 app.get(
   "/api/tracks",
   requireAuth,
@@ -1001,10 +1134,12 @@ app.get(
     await dbReady;
 
     const result = await db.execute({
-      sql: `SELECT *
-            FROM tracks
-            WHERE user_id = ?
-            ORDER BY saved_at DESC, id DESC`,
+      sql: `
+        SELECT *
+        FROM tracks
+        WHERE user_id = ?
+        ORDER BY saved_at DESC, id DESC
+      `,
       args: [req.userId],
     });
 
@@ -1015,7 +1150,6 @@ app.get(
   })
 );
 
-// TRACKS: GET ONE
 app.get(
   "/api/tracks/:id",
   requireAuth,
@@ -1032,7 +1166,11 @@ app.get(
     }
 
     const result = await db.execute({
-      sql: "SELECT * FROM tracks WHERE id = ? AND user_id = ?",
+      sql: `
+        SELECT *
+        FROM tracks
+        WHERE id = ? AND user_id = ?
+      `,
       args: [id, req.userId],
     });
 
@@ -1050,7 +1188,6 @@ app.get(
   })
 );
 
-// TRACKS: DELETE
 app.delete(
   "/api/tracks/:id",
   requireAuth,
@@ -1067,7 +1204,10 @@ app.delete(
     }
 
     const result = await db.execute({
-      sql: "DELETE FROM tracks WHERE id = ? AND user_id = ?",
+      sql: `
+        DELETE FROM tracks
+        WHERE id = ? AND user_id = ?
+      `,
       args: [id, req.userId],
     });
 
@@ -1078,9 +1218,8 @@ app.delete(
   })
 );
 
-/* ================================
-   CHAT: FIND USERS
-================================ */
+/* CHAT */
+
 app.get(
   "/api/chat/users",
   requireAuth,
@@ -1094,11 +1233,7 @@ app.get(
 
     const result = await db.execute({
       sql: `
-        SELECT
-          id,
-          username,
-          display_name,
-          profile_photo
+        SELECT id, username, display_name, profile_photo
         FROM users
         WHERE id != ?
           AND (
@@ -1129,9 +1264,6 @@ app.get(
   })
 );
 
-/* ================================
-   CHAT: LIST CONVERSATIONS
-================================ */
 app.get(
   "/api/chat/conversations",
   requireAuth,
@@ -1151,15 +1283,13 @@ app.get(
             SELECT m.body
             FROM messages m
             WHERE m.conversation_id = c.id
-            ORDER BY m.id DESC
-            LIMIT 1
+            ORDER BY m.id DESC LIMIT 1
           ) AS last_message,
           (
             SELECT m.created_at
             FROM messages m
             WHERE m.conversation_id = c.id
-            ORDER BY m.id DESC
-            LIMIT 1
+            ORDER BY m.id DESC LIMIT 1
           ) AS last_message_at,
           (
             SELECT COUNT(*)
@@ -1174,17 +1304,15 @@ app.get(
             WHEN c.user_one_id = ? THEN c.user_two_id
             ELSE c.user_one_id
           END
-        WHERE c.user_one_id = ?
-           OR c.user_two_id = ?
-        ORDER BY
-          COALESCE(
-            (
-              SELECT MAX(m.id)
-              FROM messages m
-              WHERE m.conversation_id = c.id
-            ),
-            c.id
-          ) DESC
+        WHERE c.user_one_id = ? OR c.user_two_id = ?
+        ORDER BY COALESCE(
+          (
+            SELECT MAX(m.id)
+            FROM messages m
+            WHERE m.conversation_id = c.id
+          ),
+          c.id
+        ) DESC
       `,
       args: [
         req.userId,
@@ -1214,9 +1342,6 @@ app.get(
   })
 );
 
-/* ================================
-   CHAT: CREATE OR OPEN CONVERSATION
-================================ */
 app.post(
   "/api/chat/conversations",
   requireAuth,
@@ -1244,11 +1369,7 @@ app.post(
 
     const userResult = await db.execute({
       sql: `
-        SELECT
-          id,
-          username,
-          display_name,
-          profile_photo
+        SELECT id, username, display_name, profile_photo
         FROM users
         WHERE id = ?
       `,
@@ -1284,7 +1405,7 @@ app.post(
     });
 
     const conversation = conversationResult.rows[0];
-    const otherUser = userResult.rows[0];
+    const user = userResult.rows[0];
 
     res.json({
       success: true,
@@ -1292,20 +1413,16 @@ app.post(
         id: Number(conversation.id),
         createdAt: conversation.created_at,
         otherUser: {
-          id: Number(otherUser.id),
-          username: otherUser.username,
-          displayName:
-            otherUser.display_name || otherUser.username,
-          profilePhoto: otherUser.profile_photo || null,
+          id: Number(user.id),
+          username: user.username,
+          displayName: user.display_name || user.username,
+          profilePhoto: user.profile_photo || null,
         },
       },
     });
   })
 );
 
-/* ================================
-   CHAT: GET MESSAGES
-================================ */
 app.get(
   "/api/chat/conversations/:id/messages",
   requireAuth,
@@ -1324,17 +1441,21 @@ app.get(
       });
     }
 
-    const conversationResult = await db.execute({
+    const conversation = await db.execute({
       sql: `
         SELECT id
         FROM conversations
         WHERE id = ?
           AND (user_one_id = ? OR user_two_id = ?)
       `,
-      args: [conversationId, req.userId, req.userId],
+      args: [
+        conversationId,
+        req.userId,
+        req.userId,
+      ],
     });
 
-    if (!conversationResult.rows.length) {
+    if (!conversation.rows.length) {
       return res.status(404).json({
         success: false,
         message: "Conversation not found.",
@@ -1372,28 +1493,23 @@ app.get(
       args: [conversationId],
     });
 
-    const messages = result.rows.reverse().map((row) => ({
-      id: Number(row.id),
-      conversationId: Number(row.conversation_id),
-      senderId: Number(row.sender_id),
-      senderUsername: row.sender_username,
-      senderDisplayName:
-        row.sender_display_name || row.sender_username,
-      body: row.body,
-      createdAt: row.created_at,
-      readAt: row.read_at || null,
-    }));
-
     res.json({
       success: true,
-      messages,
+      messages: result.rows.reverse().map((row) => ({
+        id: Number(row.id),
+        conversationId: Number(row.conversation_id),
+        senderId: Number(row.sender_id),
+        senderUsername: row.sender_username,
+        senderDisplayName:
+          row.sender_display_name || row.sender_username,
+        body: row.body,
+        createdAt: row.created_at,
+        readAt: row.read_at || null,
+      })),
     });
   })
 );
 
-/* ================================
-   CHAT: SEND MESSAGE
-================================ */
 app.post(
   "/api/chat/conversations/:id/messages",
   requireAuth,
@@ -1401,6 +1517,7 @@ app.post(
     await dbReady;
 
     const conversationId = Number(req.params.id);
+
     const body =
       typeof req.body?.body === "string"
         ? req.body.body.trim()
@@ -1430,24 +1547,28 @@ app.post(
       });
     }
 
-    const conversationResult = await db.execute({
+    const conversation = await db.execute({
       sql: `
         SELECT id
         FROM conversations
         WHERE id = ?
           AND (user_one_id = ? OR user_two_id = ?)
       `,
-      args: [conversationId, req.userId, req.userId],
+      args: [
+        conversationId,
+        req.userId,
+        req.userId,
+      ],
     });
 
-    if (!conversationResult.rows.length) {
+    if (!conversation.rows.length) {
       return res.status(404).json({
         success: false,
         message: "Conversation not found.",
       });
     }
 
-    const insertResult = await db.execute({
+    const inserted = await db.execute({
       sql: `
         INSERT INTO messages (conversation_id, sender_id, body)
         VALUES (?, ?, ?)
@@ -1455,7 +1576,7 @@ app.post(
       args: [conversationId, req.userId, body],
     });
 
-    const messageResult = await db.execute({
+    const result = await db.execute({
       sql: `
         SELECT
           m.id,
@@ -1470,10 +1591,10 @@ app.post(
         JOIN users u ON u.id = m.sender_id
         WHERE m.id = ?
       `,
-      args: [Number(insertResult.lastInsertRowid)],
+      args: [Number(inserted.lastInsertRowid)],
     });
 
-    const row = messageResult.rows[0];
+    const row = result.rows[0];
 
     res.status(201).json({
       success: true,
@@ -1492,7 +1613,8 @@ app.post(
   })
 );
 
-// 404 HANDLER
+/* NOT FOUND AND ERROR HANDLERS */
+
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -1500,11 +1622,17 @@ app.use((req, res) => {
   });
 });
 
-// ERROR HANDLER
 app.use((error, req, res, next) => {
-  console.error("API request failed:", error.message);
+  console.error("API request failed:", {
+    method: req.method,
+    path: req.originalUrl,
+    code: error.code || null,
+    message: error.message,
+  });
 
-  if (res.headersSent) return next(error);
+  if (res.headersSent) {
+    return next(error);
+  }
 
   res.status(500).json({
     success: false,
