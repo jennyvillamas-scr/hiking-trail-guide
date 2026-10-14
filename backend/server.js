@@ -983,6 +983,23 @@ app.post(
   })
 );
 
+await db.execute(`
+  CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trail_id TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (trail_id) REFERENCES trails(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  )
+`);
+
+await db.execute(`
+  CREATE INDEX IF NOT EXISTS idx_reviews_trail_created
+  ON reviews(trail_id, created_at)
+`);
 
 /* FAVORITES */
 
@@ -1665,6 +1682,143 @@ app.post(
   })
 );
 
+app.get("/api/trails/:trailId/reviews", asyncHandler(async (req, res) => {
+  await dbReady;
+
+  const trailId = req.params.trailId;
+
+  const trailResult = await db.execute({
+    sql: "SELECT id FROM trails WHERE id = ?",
+    args: [trailId],
+  });
+
+  if (trailResult.rows.length === 0) {
+    return res.status(404).json({
+      success: false,
+      message: "Trail not found.",
+    });
+  }
+
+  const result = await db.execute({
+    sql: `
+      SELECT
+        r.id,
+        r.trail_id,
+        r.rating,
+        r.comment,
+        r.created_at,
+        COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name
+      FROM reviews r
+      JOIN users u ON u.id = r.user_id
+      WHERE r.trail_id = ?
+      ORDER BY r.created_at DESC, r.id DESC
+    `,
+    args: [trailId],
+  });
+
+  const reviews = result.rows.map((row) => ({
+    id: String(row.id),
+    trailId: row.trail_id,
+    rating: Number(row.rating),
+    comment: row.comment,
+    reviewerName: row.reviewer_name,
+    createdAt: row.created_at,
+  }));
+
+  const averageRating = reviews.length
+    ? reviews.reduce((sum, review) => sum + review.rating, 0) / reviews.length
+    : 0;
+
+  res.json({
+    success: true,
+    count: reviews.length,
+    averageRating: Number(averageRating.toFixed(1)),
+    reviews,
+  });
+}));
+
+app.post(
+  "/api/trails/:trailId/reviews",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const trailId = req.params.trailId;
+    const rating = Number(req.body.rating);
+    const comment =
+      typeof req.body.comment === "string"
+        ? req.body.comment.trim()
+        : "";
+
+    if (
+      !Number.isInteger(rating) ||
+      rating < 1 ||
+      rating > 5
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Rating must be between 1 and 5.",
+      });
+    }
+
+    if (!comment || comment.length > 1000) {
+      return res.status(400).json({
+        success: false,
+        message: "Comment is required and must not exceed 1000 characters.",
+      });
+    }
+
+    const trailResult = await db.execute({
+      sql: "SELECT id FROM trails WHERE id = ?",
+      args: [trailId],
+    });
+
+    if (trailResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Trail not found.",
+      });
+    }
+
+    const insertResult = await db.execute({
+      sql: `
+        INSERT INTO reviews (trail_id, user_id, rating, comment)
+        VALUES (?, ?, ?, ?)
+      `,
+      args: [trailId, req.userId, rating, comment],
+    });
+
+    const result = await db.execute({
+      sql: `
+        SELECT
+          r.id,
+          r.trail_id,
+          r.rating,
+          r.comment,
+          r.created_at,
+          COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name
+        FROM reviews r
+        JOIN users u ON u.id = r.user_id
+        WHERE r.id = ?
+      `,
+      args: [insertResult.lastInsertRowid.toString()],
+    });
+
+    const row = result.rows[0];
+
+    res.status(201).json({
+      success: true,
+      review: {
+        id: String(row.id),
+        trailId: row.trail_id,
+        rating: Number(row.rating),
+        comment: row.comment,
+        reviewerName: row.reviewer_name,
+        createdAt: row.created_at,
+      },
+    });
+  })
+);
 /* NOT FOUND AND ERROR HANDLERS */
 
 app.use((req, res) => {
