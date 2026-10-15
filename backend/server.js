@@ -1666,7 +1666,7 @@ app.post(
           m.read_at,
           u.username AS sender_username,
           u.display_name AS sender_display_name
-          u.profile_photo AS reviewer_photo
+          u.profile_photo AS sender_profile_photo
         FROM messages m
         JOIN users u ON u.id = m.sender_id
         WHERE m.id = ?
@@ -1805,39 +1805,40 @@ app.post(
     });
 
     
-  const result = await db.execute({
-    sql: `
-      SELECT
-        r.id,
-        r.trail_id,
-        r.rating,
-        r.comment,
-        r.created_at,
-        COALESCE(NULLIF(u.display_name, ''), 
-        u.display_name AS sender_display_name,
-        u.profile_photo AS sender_profile_photo
-      FROM reviews r
-      JOIN users u ON u.id = r.user_id
-      WHERE r.id = ?
-    `,
-    args: [insertResult.lastInsertRowid.toString()],
-  });
+
+const result = await db.execute({
+  sql: `
+    SELECT
+      r.id,
+      r.trail_id,
+      r.rating,
+      r.comment,
+      r.created_at,
+      COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name,
+      u.profile_photo AS reviewer_photo
+    FROM reviews r
+    JOIN users u ON u.id = r.user_id
+    WHERE r.id = ?
+  `,
+  args: [insertResult.lastInsertRowid.toString()],
+});
 
 
-    const row = result.rows[0];
+const row = result.rows[0];
 
-    res.status(201).json({
-      success: true,
-      review: {
-      id: String(row.id),
-      trailId: row.trail_id,
-      rating: Number(row.rating),
-      comment: row.comment,
-      reviewerName: row.reviewer_name,
-      profilePhoto: row.sender_profile_photo,
-      createdAt: row.created_at,
-    },
-    });
+res.status(201).json({
+  success: true,
+  review: {
+    id: String(row.id),
+    trailId: row.trail_id,
+    rating: Number(row.rating),
+    comment: row.comment,
+    reviewerName: row.reviewer_name,
+    profilePhoto: row.reviewer_photo || null,
+    createdAt: row.created_at,
+  },
+});
+
   })
 );
 /* NOT FOUND AND ERROR HANDLERS */
