@@ -20,7 +20,7 @@ import {
 } from 'react-native';
 import { DIFFICULTY_COLORS } from '../constants/trailConfig';
 
-const API_URL = 'https://hiking-trail-guide-cw985my7i-villamasj.vercel.app';
+const API_URL = 'https://hiking-trail-guide-api.vercel.app';
 
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 const SHEET_HEIGHT = SCREEN_H * 0.62;

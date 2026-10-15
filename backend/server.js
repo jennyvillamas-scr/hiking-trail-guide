@@ -1711,6 +1711,7 @@ app.get("/api/trails/:trailId/reviews", asyncHandler(async (req, res) => {
     });
   }
 
+  
   const result = await db.execute({
     sql: `
       SELECT
@@ -1719,7 +1720,7 @@ app.get("/api/trails/:trailId/reviews", asyncHandler(async (req, res) => {
         r.rating,
         r.comment,
         r.created_at,
-        COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name
+        COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name,
         u.profile_photo AS reviewer_photo
       FROM reviews r
       JOIN users u ON u.id = r.user_id
@@ -1728,6 +1729,7 @@ app.get("/api/trails/:trailId/reviews", asyncHandler(async (req, res) => {
     `,
     args: [trailId],
   });
+
 
   const reviews = result.rows.map((row) => ({
     id: String(row.id),
@@ -1802,34 +1804,39 @@ app.post(
       args: [trailId, req.userId, rating, comment],
     });
 
-    const result = await db.execute({
-      sql: `
-        SELECT
-          r.id,
-          r.trail_id,
-          r.rating,
-          r.comment,
-          r.created_at,
-          COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name
-        FROM reviews r
-        JOIN users u ON u.id = r.user_id
-        WHERE r.id = ?
-      `,
-      args: [insertResult.lastInsertRowid.toString()],
-    });
+    
+  const result = await db.execute({
+    sql: `
+      SELECT
+        r.id,
+        r.trail_id,
+        r.rating,
+        r.comment,
+        r.created_at,
+        COALESCE(NULLIF(u.display_name, ''), 
+        u.display_name AS sender_display_name,
+        u.profile_photo AS sender_profile_photo
+      FROM reviews r
+      JOIN users u ON u.id = r.user_id
+      WHERE r.id = ?
+    `,
+    args: [insertResult.lastInsertRowid.toString()],
+  });
+
 
     const row = result.rows[0];
 
     res.status(201).json({
       success: true,
       review: {
-        id: String(row.id),
-        trailId: row.trail_id,
-        rating: Number(row.rating),
-        comment: row.comment,
-        reviewerName: row.reviewer_name,
-        createdAt: row.created_at,
-      },
+      id: String(row.id),
+      trailId: row.trail_id,
+      rating: Number(row.rating),
+      comment: row.comment,
+      reviewerName: row.reviewer_name,
+      profilePhoto: row.sender_profile_photo,
+      createdAt: row.created_at,
+    },
     });
   })
 );
