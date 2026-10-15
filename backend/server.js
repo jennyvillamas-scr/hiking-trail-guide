@@ -10,6 +10,13 @@ const db = require("./db");
 
 const app = express();
 
+app.get("/api/deploy-check", (req, res) => {
+  res.json({
+    success: true,
+    message: "Latest server.js is running."
+  });
+});
+
 app.use(cors());
 app.use(express.json({ limit: "8mb" }));
 
