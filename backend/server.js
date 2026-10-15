@@ -1527,11 +1527,7 @@ app.get(
         WHERE id = ?
           AND (user_one_id = ? OR user_two_id = ?)
       `,
-      args: [
-        conversationId,
-        req.userId,
-        req.userId,
-      ],
+      args: [conversationId, req.userId, req.userId],
     });
 
     if (!conversation.rows.length) {
@@ -1562,7 +1558,8 @@ app.get(
           m.created_at,
           m.read_at,
           u.username AS sender_username,
-          u.display_name AS sender_display_name
+          u.display_name AS sender_display_name,
+          u.profile_photo AS sender_profile_photo
         FROM messages m
         JOIN users u ON u.id = m.sender_id
         WHERE m.conversation_id = ?
@@ -1574,6 +1571,7 @@ app.get(
 
     res.json({
       success: true,
+      currentUserId: req.userId,
       messages: result.rows.reverse().map((row) => ({
         id: Number(row.id),
         conversationId: Number(row.conversation_id),
@@ -1581,6 +1579,8 @@ app.get(
         senderUsername: row.sender_username,
         senderDisplayName:
           row.sender_display_name || row.sender_username,
+        senderProfilePhoto: row.sender_profile_photo || null,
+        isMine: Number(row.sender_id) === Number(req.userId),
         body: row.body,
         createdAt: row.created_at,
         readAt: row.read_at || null,
@@ -1633,11 +1633,7 @@ app.post(
         WHERE id = ?
           AND (user_one_id = ? OR user_two_id = ?)
       `,
-      args: [
-        conversationId,
-        req.userId,
-        req.userId,
-      ],
+      args: [conversationId, req.userId, req.userId],
     });
 
     if (!conversation.rows.length) {
@@ -1665,7 +1661,7 @@ app.post(
           m.created_at,
           m.read_at,
           u.username AS sender_username,
-          u.display_name AS sender_display_name
+          u.display_name AS sender_display_name,
           u.profile_photo AS sender_profile_photo
         FROM messages m
         JOIN users u ON u.id = m.sender_id
@@ -1676,6 +1672,13 @@ app.post(
 
     const row = result.rows[0];
 
+    if (!row) {
+      return res.status(500).json({
+        success: false,
+        message: "Message was sent, but could not be retrieved.",
+      });
+    }
+
     res.status(201).json({
       success: true,
       message: {
@@ -1685,9 +1688,10 @@ app.post(
         senderUsername: row.sender_username,
         senderDisplayName:
           row.sender_display_name || row.sender_username,
+        senderProfilePhoto: row.sender_profile_photo || null,
+        isMine: Number(row.sender_id) === Number(req.userId),
         body: row.body,
         createdAt: row.created_at,
-        profilePhoto: row.reviewer_photo,
         readAt: row.read_at || null,
       },
     });
