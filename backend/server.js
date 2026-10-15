@@ -1666,6 +1666,7 @@ app.post(
           m.read_at,
           u.username AS sender_username,
           u.display_name AS sender_display_name
+          u.profile_photo AS reviewer_photo
         FROM messages m
         JOIN users u ON u.id = m.sender_id
         WHERE m.id = ?
@@ -1686,6 +1687,7 @@ app.post(
           row.sender_display_name || row.sender_username,
         body: row.body,
         createdAt: row.created_at,
+        profilePhoto: row.reviewer_photo,
         readAt: row.read_at || null,
       },
     });
@@ -1718,6 +1720,7 @@ app.get("/api/trails/:trailId/reviews", asyncHandler(async (req, res) => {
         r.comment,
         r.created_at,
         COALESCE(NULLIF(u.display_name, ''), u.username) AS reviewer_name
+        u.profile_photo AS reviewer_photo
       FROM reviews r
       JOIN users u ON u.id = r.user_id
       WHERE r.trail_id = ?
@@ -1732,6 +1735,7 @@ app.get("/api/trails/:trailId/reviews", asyncHandler(async (req, res) => {
     rating: Number(row.rating),
     comment: row.comment,
     reviewerName: row.reviewer_name,
+    profilePhoto: row.reviewer_photo,
     createdAt: row.created_at,
   }));
 
