@@ -319,6 +319,14 @@ app.get(
   })
 );
 
+app.get("/api/debug/routes", (req, res) => {
+  res.json({
+    success: true,
+    message: "Updated PEAKLY backend is running.",
+  });
+});
+
+
 app.post(
   "/api/auth/register",
   asyncHandler(async (req, res) => {
