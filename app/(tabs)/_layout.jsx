@@ -1,10 +1,72 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { Tabs, useRouter } from 'expo-router';
-import { StyleSheet, TouchableOpacity, View } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  AppState,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+
+const API_URL = 'https://hiking-trail-guide-api.vercel.app/api';
 
 export default function TabLayout() {
   const router = useRouter();
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const loadUnreadCount = useCallback(async () => {
+    try {
+      const token = await SecureStore.getItemAsync('authToken');
+
+      if (!token) {
+        setUnreadCount(0);
+        return;
+      }
+
+      const response = await fetch(`${API_URL}/chat/conversations`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/json',
+        },
+      });
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || 'Unable to check unread messages.');
+      }
+
+      const totalUnread = Array.isArray(data.conversations)
+        ? data.conversations.reduce(
+            (total, conversation) =>
+              total + Math.max(0, Number(conversation.unreadCount) || 0),
+            0
+          )
+        : 0;
+
+      setUnreadCount(totalUnread);
+    } catch (error) {
+      console.warn('Unable to refresh unread message count:', error.message);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadUnreadCount();
+
+    const interval = setInterval(loadUnreadCount, 5000);
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        loadUnreadCount();
+      }
+    });
+
+    return () => {
+      clearInterval(interval);
+      subscription.remove();
+    };
+  }, [loadUnreadCount]);
 
   return (
     <SafeAreaProvider>
@@ -14,23 +76,23 @@ export default function TabLayout() {
             headerShown: true,
             headerTitleAlign: 'left',
             headerStyle: {
-              backgroundColor: '#694F2E',
+              backgroundColor: '#3B2818',
               height: 80,
             },
-            headerTintColor: '#C9AD8A',
+            headerTintColor: '#F7F0E6',
             headerTitleStyle: {
               fontSize: 22,
               fontWeight: 'bold',
             },
-            tabBarActiveTintColor: '#DCC6A9',
-            tabBarInactiveTintColor: '#8D785F',
+            tabBarActiveTintColor: '#F7F0E6',
+            tabBarInactiveTintColor: '#C9AD8A',
             tabBarStyle: {
               height: 68,
               paddingBottom: 9,
               paddingTop: 7,
-              backgroundColor: '#694F2E',
+              backgroundColor: '#3B2818',
               borderTopWidth: 1,
-              borderTopColor: '#8D6D48',
+              borderTopColor: '#59412D',
               elevation: 12,
             },
             tabBarLabelStyle: {
@@ -135,14 +197,24 @@ export default function TabLayout() {
           activeOpacity={0.85}
           onPress={() => router.push('/messages')}
           accessibilityRole="button"
-          accessibilityLabel="Open messages"
+          accessibilityLabel={
+            unreadCount > 0
+              ? `Open messages, ${unreadCount} unread`
+              : 'Open messages'
+          }
         >
           <MaterialCommunityIcons
             name="message-text"
             size={27}
             color="#F7F0E6"
           />
-          <View style={styles.onlineDot} />
+          {unreadCount > 0 && (
+            <View style={styles.unreadBadge}>
+              <Text style={styles.unreadBadgeText}>
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </Text>
+            </View>
+          )}
         </TouchableOpacity>
       </View>
     </SafeAreaProvider>
@@ -161,7 +233,7 @@ const styles = StyleSheet.create({
     width: 56,
     height: 56,
     borderRadius: 28,
-    backgroundColor: '#694F2E',
+    backgroundColor: '#3B2818',
     borderWidth: 1,
     borderColor: '#C9AD8A',
     alignItems: 'center',
@@ -176,15 +248,24 @@ const styles = StyleSheet.create({
     shadowRadius: 5,
     zIndex: 100,
   },
-  onlineDot: {
+  unreadBadge: {
     position: 'absolute',
-    top: 4,
-    right: 4,
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: '#8BA66A',
+    top: -5,
+    right: -5,
+    minWidth: 21,
+    height: 21,
+    paddingHorizontal: 5,
+    borderRadius: 11,
+    backgroundColor: '#D94F55',
+    borderColor: '#3B2818',
     borderWidth: 2,
-    borderColor: '#694F2E',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  unreadBadgeText: {
+    color: '#FFFFFF',
+    fontSize: 10,
+    lineHeight: 13,
+    fontWeight: '900',
   },
 });

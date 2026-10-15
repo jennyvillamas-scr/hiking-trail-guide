@@ -1,16 +1,23 @@
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
 import * as SecureStore from 'expo-secure-store';
+import { AppState } from 'react-native';
 
 const API_URL = 'https://hiking-trail-guide-api.vercel.app/api';
 const TRACKS_KEY = '@verdant_hiking_tracks';
 
 let syncInProgress = false;
+let networkListener = null;
+let appStateListener = null;
 
 async function readLocalTracks() {
   try {
     const stored = await AsyncStorage.getItem(TRACKS_KEY);
-    return stored ? JSON.parse(stored) : [];
+    if (!stored) return [];
+
+    const tracks = JSON.parse(stored);
+    return Array.isArray(tracks) ? tracks : [];
   } catch (error) {
     console.error('Could not read local hiking tracks:', error);
     return [];
@@ -25,8 +32,12 @@ async function getAuthToken() {
   const keys = ['authToken', 'token', 'userToken'];
 
   for (const key of keys) {
-    const token = await SecureStore.getItemAsync(key);
-    if (token) return token;
+    try {
+      const token = await SecureStore.getItemAsync(key);
+      if (token) return token;
+    } catch (error) {
+      console.warn(`Could not read authentication token (${key}).`);
+    }
   }
 
   return null;
@@ -78,6 +89,34 @@ function toApiTrack(track) {
   };
 }
 
+function setupSyncListeners() {
+  if (!networkListener) {
+    networkListener = NetInfo.addEventListener((state) => {
+      const online =
+        state.isConnected === true &&
+        state.isInternetReachable !== false;
+
+      if (online) {
+        syncTracks().catch((error) => {
+          console.log('Automatic track sync failed:', error.message);
+        });
+      }
+    });
+  }
+
+  if (!appStateListener) {
+    appStateListener = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        syncTracks().catch((error) => {
+          console.log('Track sync on app resume failed:', error.message);
+        });
+      }
+    });
+  }
+}
+
+setupSyncListeners();
+
 export async function saveTrack(track) {
   const saved = {
     ...normalizeTrack(track),
@@ -89,9 +128,9 @@ export async function saveTrack(track) {
   const tracks = await readLocalTracks();
   await writeLocalTracks([saved, ...tracks]);
 
-  // Saving locally succeeds even if this attempt to sync fails.
+  // The local save finishes before any network request.
   syncTracks().catch((error) => {
-    console.log('Track saved offline; sync will be retried later:', error.message);
+    console.log('Track saved locally; sync will retry:', error.message);
   });
 
   return saved;
@@ -103,11 +142,15 @@ export async function getTracks() {
 
 export async function getTrackById(id) {
   const tracks = await readLocalTracks();
-  return tracks.find((track) => String(track.id) === String(id)) ?? null;
+
+  return (
+    tracks.find((track) => String(track.id) === String(id)) ?? null
+  );
 }
 
 export async function deleteTrack(id) {
   const tracks = await readLocalTracks();
+
   await writeLocalTracks(
     tracks.filter((track) => String(track.id) !== String(id))
   );
@@ -136,7 +179,7 @@ export async function syncTracks() {
 
         await writeLocalTracks(
           latestTracks.map((item) =>
-            item.id === track.id
+            String(item.id) === String(track.id)
               ? {
                   ...item,
                   synced: true,
@@ -145,9 +188,14 @@ export async function syncTracks() {
               : item
           )
         );
+
+        console.log(`Track ${track.id} synced successfully.`);
       } catch (error) {
-        // Keep unsynced tracks locally for the next attempt.
-        console.log(`Track ${track.id} is still waiting to sync:`, error.message);
+        // Keep this track locally so a later attempt can retry it.
+        console.log(
+          `Track ${track.id} is still waiting to sync:`,
+          error.message
+        );
       }
     }
   } finally {

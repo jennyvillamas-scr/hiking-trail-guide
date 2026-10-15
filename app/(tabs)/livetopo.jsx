@@ -1,6 +1,14 @@
-
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import {
+  Camera,
+  GeoJSONSource,
+  Layer,
+  Map as MapLibreMap,
+  Marker,
+} from '@maplibre/maplibre-react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
+import * as Network from 'expo-network';
 import {
   useFocusEffect,
   useLocalSearchParams,
@@ -11,16 +19,34 @@ import {
   ActivityIndicator,
   Alert,
   PanResponder,
+  ScrollView,
   StyleSheet,
   Text,
   TouchableOpacity,
   View,
 } from 'react-native';
-import MapView, { Circle, Marker, Polyline } from 'react-native-maps';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { OSM_STYLE } from '../../constants/mapStyle';
 import { useTrails } from '../../hooks/useTrails';
 import { saveTrack } from '../../services/trackService';
+
+const OFFLINE_TRAILS_KEY = '@peakly_downloaded_trails';
+
+const COLORS = {
+  primary: '#694F2E',
+  secondary: '#C9AD8A',
+  background: '#F7F0E6',
+  card: '#FBF7F0',
+  border: '#E8DCCB',
+  blue: '#2563EB',
+  green: '#22C55E',
+  red: '#DC2626',
+  amber: '#F59E0B',
+  text: '#332719',
+  muted: '#66736B',
+  white: '#FFFFFF',
+};
 
 const DEFAULT_REGION = {
   latitude: 10.3157,
@@ -29,31 +55,20 @@ const DEFAULT_REGION = {
   longitudeDelta: 0.08,
 };
 
-const ORANGE = '#FF8A00';
-const GREEN = '#22C55E';
-const BLUE = '#2563EB';
-const DARK = '#17211B';
-const MUTED = '#66736B';
-const RED = '#DC2626';
-const AMBER = '#F59E0B';
-const DARK_GREEN = '#16A34A';
-
 const ROUTING_BASE_URL =
   'https://routing.openstreetmap.de/routed-foot/route/v1/driving';
+
 const ROUTING_USER_AGENT = 'HikingApp/1.0 (Expo React Native)';
 const ROUTE_TIMEOUT_MS = 12000;
-const MIN_REFETCH_MS = 10000;
-const STRAIGHT_RETRY_MS = 30000;
-const OFF_ROUTE_METERS = 40;
 const ARRIVAL_METERS = 25;
 const MAX_ACCEPTED_ACCURACY_M = 100;
-
 const MAX_RECORD_ACCURACY_M = 30;
 const MIN_RECORD_STEP_M = 4;
 const MAX_RECORD_SPEED_MPS = 15;
 const ALTITUDE_THRESHOLD_M = 3;
-
+const MAX_OFFLINE_ROUTE_POINTS = 600;
 const EARTH_RADIUS_M = 6371000;
+
 const toRad = (degrees) => (degrees * Math.PI) / 180;
 
 function distanceMeters(a, b) {
@@ -66,18 +81,22 @@ function distanceMeters(a, b) {
       Math.cos(toRad(b.latitude)) *
       Math.sin(dLng / 2) ** 2;
 
-  return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(h)));
+  return (
+    2 *
+    EARTH_RADIUS_M *
+    Math.asin(Math.min(1, Math.sqrt(h)))
+  );
 }
 
-function distanceToSegmentMeters(p, a, b) {
-  const metersPerDegLat = (EARTH_RADIUS_M * Math.PI) / 180;
-  const metersPerDegLng =
-    metersPerDegLat * Math.cos(toRad(p.latitude));
+function distanceToSegmentMeters(point, a, b) {
+  const metersPerDegree = (EARTH_RADIUS_M * Math.PI) / 180;
+  const metersPerLongitude =
+    metersPerDegree * Math.cos(toRad(point.latitude));
 
-  const ax = (a.longitude - p.longitude) * metersPerDegLng;
-  const ay = (a.latitude - p.latitude) * metersPerDegLat;
-  const bx = (b.longitude - p.longitude) * metersPerDegLng;
-  const by = (b.latitude - p.latitude) * metersPerDegLat;
+  const ax = (a.longitude - point.longitude) * metersPerLongitude;
+  const ay = (a.latitude - point.latitude) * metersPerDegree;
+  const bx = (b.longitude - point.longitude) * metersPerLongitude;
+  const by = (b.latitude - point.latitude) * metersPerDegree;
 
   const dx = bx - ax;
   const dy = by - ay;
@@ -90,10 +109,9 @@ function distanceToSegmentMeters(p, a, b) {
 
   t = Math.max(0, Math.min(1, t));
 
-  const cx = ax + t * dx;
-  const cy = ay + t * dy;
-
-  return Math.sqrt(cx * cx + cy * cy);
+  return Math.sqrt(
+    (ax + t * dx) ** 2 + (ay + t * dy) ** 2
+  );
 }
 
 function formatDistance(meters) {
@@ -104,7 +122,7 @@ function formatDistance(meters) {
 }
 
 function formatDuration(seconds) {
-  if (!Number.isFinite(seconds)) return '--';
+  if (!Number.isFinite(seconds) || seconds <= 0) return '--';
 
   const totalMinutes = Math.max(1, Math.round(seconds / 60));
 
@@ -113,7 +131,25 @@ function formatDuration(seconds) {
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
 
-  return minutes === 0 ? `${hours} h` : `${hours} h ${minutes} min`;
+  return minutes ? `${hours} h ${minutes} min` : `${hours} h`;
+}
+
+function formatClock(milliseconds) {
+  const totalSeconds = Math.max(
+    0,
+    Math.floor((milliseconds || 0) / 1000)
+  );
+
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  const mm = String(minutes).padStart(2, '0');
+  const ss = String(seconds).padStart(2, '0');
+
+  return hours
+    ? `${hours}:${mm}:${ss}`
+    : `${mm}:${ss}`;
 }
 
 async function fetchFootRoute(from, to, signal) {
@@ -121,7 +157,7 @@ async function fetchFootRoute(from, to, signal) {
     `${ROUTING_BASE_URL}/` +
     `${from.longitude.toFixed(6)},${from.latitude.toFixed(6)};` +
     `${to.longitude.toFixed(6)},${to.latitude.toFixed(6)}` +
-    `?overview=full&geometries=geojson&steps=false&alternatives=false`;
+    '?overview=full&geometries=geojson&steps=false&alternatives=false';
 
   const response = await fetch(url, {
     signal,
@@ -144,7 +180,7 @@ async function fetchFootRoute(from, to, signal) {
     !Array.isArray(rawCoordinates) ||
     rawCoordinates.length < 2
   ) {
-    throw new Error(json?.code || 'NoRoute');
+    throw new Error(json?.code || 'No route found');
   }
 
   const coordinates = rawCoordinates.map(([longitude, latitude]) => ({
@@ -218,19 +254,7 @@ function buildRouteMetrics(inputCoordinates, durationS = 0) {
   };
 }
 
-function formatClock(ms) {
-  const totalSeconds = Math.max(0, Math.floor((ms || 0) / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  const mm = String(minutes).padStart(2, '0');
-  const ss = String(seconds).padStart(2, '0');
-
-  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
-}
-
-function Stat({ label, value, divider = false }) {
+function Stat({ label, value, divider }) {
   return (
     <View style={[styles.stat, divider && styles.statDivider]}>
       <Text style={styles.statValue}>{value}</Text>
@@ -239,22 +263,91 @@ function Stat({ label, value, divider = false }) {
   );
 }
 
+const EMPTY_COLLECTION = { type: 'FeatureCollection', features: [] };
+
+function toLngLat(point) {
+  return [point.longitude, point.latitude];
+}
+
+function lineFeature(points) {
+  if (!Array.isArray(points) || points.length < 2) return EMPTY_COLLECTION;
+
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: {
+      type: 'LineString',
+      coordinates: points.map(toLngLat),
+    },
+  };
+}
+
+function circleFeature(center, radiusM, steps = 48) {
+  if (!center) return EMPTY_COLLECTION;
+
+  const earthRadius = 6378137;
+  const lat = (center.latitude * Math.PI) / 180;
+  const ring = [];
+
+  for (let i = 0; i <= steps; i += 1) {
+    const angle = (i / steps) * 2 * Math.PI;
+    const dLat = (radiusM * Math.cos(angle)) / earthRadius;
+    const dLon =
+      (radiusM * Math.sin(angle)) / (earthRadius * Math.cos(lat));
+
+    ring.push([
+      center.longitude + (dLon * 180) / Math.PI,
+      center.latitude + (dLat * 180) / Math.PI,
+    ]);
+  }
+
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: { type: 'Polygon', coordinates: [ring] },
+  };
+}
+
+// Same idea as the old latitudeDelta: smaller delta = higher zoom.
+function deltaToZoom(delta) {
+  return Math.max(2, Math.min(18, Math.log2(360 / delta)));
+}
+
+function fitCamera(camera, points, padding) {
+  if (!camera || !points?.length) return;
+
+  const lats = points.map((point) => point.latitude);
+  const lons = points.map((point) => point.longitude);
+
+  let west = Math.min(...lons);
+  let east = Math.max(...lons);
+  let south = Math.min(...lats);
+  let north = Math.max(...lats);
+
+  // Avoid zooming in absurdly far when points are almost identical.
+  const MIN_SPAN = 0.004;
+
+  if (east - west < MIN_SPAN) {
+    const mid = (east + west) / 2;
+    west = mid - MIN_SPAN / 2;
+    east = mid + MIN_SPAN / 2;
+  }
+
+  if (north - south < MIN_SPAN) {
+    const mid = (north + south) / 2;
+    south = mid - MIN_SPAN / 2;
+    north = mid + MIN_SPAN / 2;
+  }
+
+  camera.fitBounds([west, south, east, north], {
+    padding,
+    duration: 600,
+  });
+}
+
 function UserMarker({ coordinate }) {
-  const [track, setTrack] = useState(true);
-
-  useEffect(() => {
-    const timer = setTimeout(() => setTrack(false), 1200);
-    return () => clearTimeout(timer);
-  }, []);
-
   return (
-    <Marker
-      coordinate={coordinate}
-      title="Your current location"
-      anchor={{ x: 0.5, y: 0.5 }}
-      tracksViewChanges={track}
-      zIndex={20}
-    >
+    <Marker lngLat={toLngLat(coordinate)} anchor="center">
       <View style={styles.currentLocationMarker}>
         <View style={styles.currentLocationDot} />
       </View>
@@ -266,24 +359,15 @@ export default function LiveTopoScreen() {
   const params = useLocalSearchParams();
   const router = useRouter();
   const mapRef = useRef(null);
-  const lastFramedTrailRef = useRef(null);
   const locationSubscriptionRef = useRef(null);
-  const hasFixRef = useRef(false);
-
-  const fetchRef = useRef({
-    inFlight: false,
-    lastAt: 0,
-    destKey: null,
-  });
   const abortRef = useRef(null);
   const retryTimerRef = useRef(null);
   const unmountedRef = useRef(false);
-  const progressRef = useRef(0);
-
-  const wantTrackingRef = useRef(false);
+  const hasFixRef = useRef(false);
   const startingRef = useRef(false);
+  const wantTrackingRef = useRef(false);
   const latestFixRef = useRef(null);
-
+  const lastRecordedRef = useRef(null);
   const recStatusRef = useRef('idle');
   const recMetaRef = useRef(null);
   const recStatsRef = useRef({
@@ -291,60 +375,27 @@ export default function LiveTopoScreen() {
     ascentM: 0,
     refAlt: null,
   });
-  const lastRecordedRef = useRef(null);
   const accumulatedMsRef = useRef(0);
   const segmentStartRef = useRef(0);
   const savingRef = useRef(false);
+  const progressRef = useRef(0);
+  const requestIdRef = useRef(0);
+
+  const trailId = Array.isArray(params.trailId)
+    ? params.trailId[0]
+    : params.trailId;
 
   const trailsResult = useTrails();
-
   const trails = Array.isArray(trailsResult)
     ? trailsResult
     : Array.isArray(trailsResult?.trails)
       ? trailsResult.trails
       : [];
 
-  const trailId = Array.isArray(params.trailId)
-    ? params.trailId[0]
-    : params.trailId;
-
   const trail = useMemo(
     () => trails.find((item) => String(item.id) === String(trailId)),
     [trails, trailId]
   );
-
-  const [location, setLocation] = useState(null);
-  const [accuracy, setAccuracy] = useState(null);
-  const [locationLoading, setLocationLoading] = useState(true);
-  const [locationError, setLocationError] = useState('');
-  const [mapReady, setMapReady] = useState(false);
-  const [isTrailPanelVisible, setIsTrailPanelVisible] = useState(true);
-
-  const panelPanResponder = useRef(
-    PanResponder.create({
-      onMoveShouldSetPanResponder: (_, gestureState) =>
-        Math.abs(gestureState.dy) > 8 &&
-        Math.abs(gestureState.dy) > Math.abs(gestureState.dx),
-      onPanResponderRelease: (_, gestureState) => {
-        if (gestureState.dy > 35) setIsTrailPanelVisible(false);
-        if (gestureState.dy < -35) setIsTrailPanelVisible(true);
-      },
-    })
-  ).current;
-
-  const [guide, setGuide] = useState(null);
-  const [guideLoading, setGuideLoading] = useState(false);
-  const [retryTick, setRetryTick] = useState(0);
-
-  const [recStatus, setRecStatus] = useState('idle');
-  const [recPoints, setRecPoints] = useState([]);
-  const [recStats, setRecStats] = useState({
-    distanceM: 0,
-    ascentM: null,
-  });
-  const [nowMs, setNowMs] = useState(Date.now());
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState('');
 
   const destination = useMemo(() => {
     if (!trail) return null;
@@ -363,6 +414,101 @@ export default function LiveTopoScreen() {
 
     return { latitude, longitude };
   }, [trail]);
+
+  const [downloadedTrail, setDownloadedTrail] = useState(null);
+  const [downloadingTrail, setDownloadingTrail] = useState(false);
+  const [deletingTrail, setDeletingTrail] = useState(false);
+
+  const [location, setLocation] = useState(null);
+  const hasLocation = location !== null;
+  const [accuracy, setAccuracy] = useState(null);
+  const [locationLoading, setLocationLoading] = useState(true);
+  const [locationError, setLocationError] = useState('');
+  const [isOnline, setIsOnline] = useState(true);
+  const [mapReady, setMapReady] = useState(false);
+  const [panelVisible, setPanelVisible] = useState(true);
+
+  const [guide, setGuide] = useState(null);
+  const [guideLoading, setGuideLoading] = useState(false);
+
+  const [recStatus, setRecStatus] = useState('idle');
+  const [recPoints, setRecPoints] = useState([]);
+  const [recStats, setRecStats] = useState({
+    distanceM: 0,
+    ascentM: null,
+  });
+  const [nowMs, setNowMs] = useState(Date.now());
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
+
+  const panelPanResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_, gesture) =>
+        Math.abs(gesture.dy) > 8 &&
+        Math.abs(gesture.dy) > Math.abs(gesture.dx),
+      onPanResponderRelease: (_, gesture) => {
+        if (gesture.dy > 35) setPanelVisible(false);
+        if (gesture.dy < -35) setPanelVisible(true);
+      },
+    })
+  ).current;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDownloadedTrail() {
+      if (!trailId) {
+        setDownloadedTrail(null);
+        return;
+      }
+
+      try {
+        const stored = await AsyncStorage.getItem(OFFLINE_TRAILS_KEY);
+        const savedTrails = stored ? JSON.parse(stored) : {};
+        const key = String(trail?.id ?? trailId);
+
+        if (!cancelled) {
+          setDownloadedTrail(savedTrails[key] ?? null);
+        }
+      } catch (error) {
+        console.warn('Unable to load offline route:', error.message);
+        if (!cancelled) setDownloadedTrail(null);
+      }
+    }
+
+    loadDownloadedTrail();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [trailId, trail?.id]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const updateNetworkStatus = (state) => {
+      if (!mounted) return;
+
+      setIsOnline(
+        state.isConnected !== false &&
+          state.isInternetReachable !== false
+      );
+    };
+
+    Network.getNetworkStateAsync()
+      .then(updateNetworkStatus)
+      .catch(() => {
+        if (mounted) setIsOnline(false);
+      });
+
+    const subscription =
+      Network.addNetworkStateListener(updateNetworkStatus);
+
+    return () => {
+      mounted = false;
+      subscription.remove();
+    };
+  }, []);
 
   const appendRecordedPoint = useCallback((fix) => {
     if (
@@ -422,12 +568,8 @@ export default function LiveTopoScreen() {
       if (unmountedRef.current) return;
 
       const coords = position?.coords ?? {};
-      const {
-        latitude,
-        longitude,
-        accuracy: fixAccuracy,
-        altitude,
-      } = coords;
+      const { latitude, longitude, accuracy: fixAccuracy, altitude } =
+        coords;
 
       if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
         return;
@@ -454,7 +596,6 @@ export default function LiveTopoScreen() {
       };
 
       latestFixRef.current = fix;
-
       setLocation({ latitude, longitude });
       setAccuracy(fix.accuracy);
       setLocationLoading(false);
@@ -571,7 +712,7 @@ export default function LiveTopoScreen() {
     if (recStatus !== 'recording') return undefined;
 
     setNowMs(Date.now());
-    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    const timer = setInterval(() => setNowMs(Date.now()));
 
     return () => clearInterval(timer);
   }, [recStatus]);
@@ -613,7 +754,6 @@ export default function LiveTopoScreen() {
     accumulatedMsRef.current = 0;
     segmentStartRef.current = startedAt;
     lastRecordedRef.current = fix;
-
     recStatsRef.current = {
       distanceM: 0,
       ascentM: 0,
@@ -621,7 +761,6 @@ export default function LiveTopoScreen() {
     };
 
     recStatusRef.current = 'recording';
-
     setSaveError('');
     setRecPoints([fix]);
     setRecStats({
@@ -646,17 +785,12 @@ export default function LiveTopoScreen() {
     if (recStatusRef.current !== 'paused') return;
 
     segmentStartRef.current = Date.now();
-
-    // Do not count distance moved while paused.
     lastRecordedRef.current = null;
-
     recStatusRef.current = 'recording';
     setNowMs(Date.now());
     setRecStatus('recording');
   }, []);
 
-  // Save a completed or discarded recording.
-  // The trackService saves locally before attempting to sync with the API.
   const persistRecording = useCallback(
     async (status) => {
       const meta = recMetaRef.current;
@@ -684,12 +818,7 @@ export default function LiveTopoScreen() {
         );
       }
 
-      // Freeze the recording before attempting the save.
-      // This prevents the duration from being counted twice on retry.
-      recMetaRef.current = {
-        ...meta,
-        endedAt,
-      };
+      recMetaRef.current = { ...meta, endedAt };
       accumulatedMsRef.current = durationMs;
       recStatusRef.current = 'finished';
       setRecStatus('finished');
@@ -719,11 +848,8 @@ export default function LiveTopoScreen() {
             : 'Your discarded hike has been saved to your Hiking History. It will sync when the server is reachable.'
         );
       } catch (error) {
-        // Keep the finished recording on screen so the user can retry.
         setSaveError(
-          status === 'completed'
-            ? 'Could not save the track on this device. Please try again.'
-            : 'Could not save the discarded track on this device. Please try again.'
+          'Could not save the track on this device. Please try again.'
         );
       } finally {
         savingRef.current = false;
@@ -732,33 +858,6 @@ export default function LiveTopoScreen() {
     },
     [recPoints, resetRecording]
   );
-
-  const discardRecording = useCallback(() => {
-    if (recStatusRef.current === 'idle' || savingRef.current) return;
-
-    Alert.alert(
-      'Discard this track?',
-      'The hike will be marked as discarded and saved in your Hiking History.',
-      [
-        {
-          text: 'Cancel',
-          style: 'cancel',
-        },
-        {
-          text: 'Discard',
-          style: 'destructive',
-          onPress: () => {
-            persistRecording('discarded');
-          },
-        },
-      ]
-    );
-  }, [persistRecording]);
-
-  const saveRecording = useCallback(() => {
-    if (recStatusRef.current !== 'finished') return;
-    persistRecording('completed');
-  }, [persistRecording]);
 
   const stopRecording = useCallback(() => {
     const status = recStatusRef.current;
@@ -783,7 +882,7 @@ export default function LiveTopoScreen() {
     if (recPoints.length < 2) {
       Alert.alert(
         'Track too short',
-        'There is not much movement recorded yet. You can keep recording or save this hike as discarded in your Hiking History.',
+        'There is not much movement recorded yet. Keep recording or discard this hike.',
         [
           {
             text: 'Keep Recording',
@@ -805,29 +904,38 @@ export default function LiveTopoScreen() {
           {
             text: 'Discard',
             style: 'destructive',
-            onPress: () => {
-              // Save directly without asking for confirmation twice.
-              persistRecording('discarded');
-            },
+            onPress: () => persistRecording('discarded'),
           },
         ]
       );
-
       return;
     }
 
-    mapRef.current?.fitToCoordinates(recPoints, {
-      edgePadding: {
-        top: 90,
-        right: 55,
-        bottom: 230,
-        left: 55,
-      },
-      animated: true,
+    fitCamera(mapRef.current, recPoints, {
+      top: 90,
+      right: 55,
+      bottom: 230,
+      left: 55,
     });
   }, [recPoints, persistRecording]);
 
-  // Guide line: user's live position -> destination.
+  const discardRecording = useCallback(() => {
+    if (recStatusRef.current === 'idle' || savingRef.current) return;
+
+    Alert.alert(
+      'Discard this track?',
+      'The hike will be marked as discarded and saved in your Hiking History.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Discard',
+          style: 'destructive',
+          onPress: () => persistRecording('discarded'),
+        },
+      ]
+    );
+  }, [persistRecording]);
+
   const destKey = destination
     ? `${trailId}:${destination.latitude},${destination.longitude}`
     : null;
@@ -835,11 +943,173 @@ export default function LiveTopoScreen() {
   const activeGuide =
     guide && guide.destKey === destKey ? guide : null;
 
+  const canDownloadRoute =
+    ['route', 'gpx'].includes(activeGuide?.source) &&
+    Array.isArray(activeGuide?.coordinates) &&
+    activeGuide.coordinates.length > 1;
+
+  const downloadCurrentRoute = useCallback(async () => {
+    if (
+      !canDownloadRoute ||
+      downloadingTrail ||
+      !trail ||
+      !destination ||
+      !activeGuide
+    ) {
+      Alert.alert(
+        'Route unavailable',
+        'Wait until a solid blue route appears before downloading.'
+      );
+      return;
+    }
+
+    try {
+      setDownloadingTrail(true);
+
+      const key = String(trail.id ?? trailId);
+      const coordinates = activeGuide.coordinates;
+      const maxPoints = MAX_OFFLINE_ROUTE_POINTS;
+      const step = Math.max(
+        1,
+        Math.ceil((coordinates.length - 1) / (maxPoints - 1))
+      );
+
+      const compactCoordinates = coordinates
+        .filter(
+          (point, index) =>
+            index % step === 0 || index === coordinates.length - 1
+        )
+        .map((point) => ({
+          latitude: Number(point.latitude.toFixed(5)),
+          longitude: Number(point.longitude.toFixed(5)),
+        }));
+
+      if (compactCoordinates.length < 2) {
+        throw new Error('The route does not contain enough points.');
+      }
+
+      const savedTrail = {
+        id: key,
+        name: String(trail.name ?? trail.title ?? 'Unnamed Trail'),
+        latitude: Number(destination.latitude),
+        longitude: Number(destination.longitude),
+        region: trail.region ?? '',
+        difficulty: trail.difficulty ?? '',
+        distanceKm: trail.distanceKm ?? null,
+        routeCoordinates: compactCoordinates,
+        routeDurationS: Number(activeGuide.durationS) || 0,
+        downloadedAt: new Date().toISOString(),
+      };
+
+      const stored = await AsyncStorage.getItem(OFFLINE_TRAILS_KEY);
+      let savedTrails = {};
+
+      if (stored) {
+        try {
+          savedTrails = JSON.parse(stored);
+        } catch {
+          savedTrails = {};
+        }
+      }
+
+      if (
+        !savedTrails ||
+        typeof savedTrails !== 'object' ||
+        Array.isArray(savedTrails)
+      ) {
+        savedTrails = {};
+      }
+
+      savedTrails[key] = savedTrail;
+
+      await AsyncStorage.setItem(
+        OFFLINE_TRAILS_KEY,
+        JSON.stringify(savedTrails)
+      );
+
+      setDownloadedTrail(savedTrail);
+
+      Alert.alert(
+        'Trail downloaded',
+        'The route and basic trail details are saved on this device. Map imagery is not downloaded.'
+      );
+    } catch (error) {
+      console.error('PEAKLY route download failed:', error);
+
+      Alert.alert(
+        'Download failed',
+        'Your device could not save the route. Free up device storage and try again.'
+      );
+    } finally {
+      setDownloadingTrail(false);
+    }
+  }, [
+    canDownloadRoute,
+    downloadingTrail,
+    trail,
+    trailId,
+    destination,
+    activeGuide,
+  ]);
+
+  const deleteDownloadedTrail = useCallback(() => {
+    if (!trailId || deletingTrail) return;
+
+    Alert.alert(
+      'Delete offline download?',
+      'This removes the saved route from this device. It does not delete the trail from the server.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setDeletingTrail(true);
+
+              const stored = await AsyncStorage.getItem(
+                OFFLINE_TRAILS_KEY
+              );
+
+              const savedTrails = stored ? JSON.parse(stored) : {};
+              const key = String(trail?.id ?? trailId);
+
+              delete savedTrails[key];
+
+              await AsyncStorage.setItem(
+                OFFLINE_TRAILS_KEY,
+                JSON.stringify(savedTrails)
+              );
+
+              setDownloadedTrail(null);
+
+              Alert.alert(
+                'Download deleted',
+                'The saved offline route has been removed from this device.'
+              );
+            } catch (error) {
+              console.warn('Unable to delete offline route:', error);
+
+              Alert.alert(
+                'Delete failed',
+                'Could not remove the saved route. Please try again.'
+              );
+            } finally {
+              setDeletingTrail(false);
+            }
+          },
+        },
+      ]
+    );
+  }, [trailId, trail, deletingTrail]);
+
   const arrived = useMemo(
     () =>
-      !!location &&
-      !!destination &&
-      distanceMeters(location, destination) <= ARRIVAL_METERS,
+      Boolean(
+        location &&
+          destination &&
+          distanceMeters(location, destination) <= ARRIVAL_METERS
+      ),
     [location, destination]
   );
 
@@ -858,21 +1128,20 @@ export default function LiveTopoScreen() {
     const points = activeGuide.coordinates;
     const lastSegment = points.length - 2;
 
-    let bestIndex = Math.min(
-      progressRef.current,
-      lastSegment
-    );
+    if (lastSegment < 0) return null;
+
+    let bestIndex = Math.min(progressRef.current, lastSegment);
     let bestDistance = Infinity;
 
     for (let i = bestIndex; i <= lastSegment; i += 1) {
-      const d = distanceToSegmentMeters(
+      const distance = distanceToSegmentMeters(
         location,
         points[i],
         points[i + 1]
       );
 
-      if (d < bestDistance) {
-        bestDistance = d;
+      if (distance < bestDistance) {
+        bestDistance = distance;
         bestIndex = i;
       }
     }
@@ -904,42 +1173,9 @@ export default function LiveTopoScreen() {
   useEffect(() => {
     if (!location || !destination || !destKey || arrived) return;
 
-    const state = fetchRef.current;
-
-    if (state.inFlight) return;
-
-    const now = Date.now();
-    const sinceLast = now - state.lastAt;
-
-    let shouldFetch = false;
-
-    if (!activeGuide) {
-      shouldFetch =
-        state.destKey !== destKey ||
-        sinceLast >= MIN_REFETCH_MS;
-    } else if (
-      activeGuide.source === 'straight' ||
-      activeGuide.source === 'gpx'
-    ) {
-      shouldFetch = sinceLast >= STRAIGHT_RETRY_MS;
-    } else {
-      const offRoute = guideInfo?.offRouteM ?? 0;
-
-      shouldFetch =
-        sinceLast >= MIN_REFETCH_MS &&
-        offRoute >
-          Math.max(OFF_ROUTE_METERS, (accuracy ?? 0) * 1.5);
-    }
-
-    if (!shouldFetch) return;
-
-    state.inFlight = true;
-    state.lastAt = now;
-    state.destKey = destKey;
-
-    setGuideLoading(true);
-
+    const currentRequest = ++requestIdRef.current;
     const controller = new AbortController();
+    abortRef.current?.abort();
     abortRef.current = controller;
 
     const timeout = setTimeout(
@@ -947,191 +1183,170 @@ export default function LiveTopoScreen() {
       ROUTE_TIMEOUT_MS
     );
 
-    (async () => {
+    setGuideLoading(true);
+
+    async function loadRoute() {
       try {
+        if (!isOnline) throw new Error('Offline');
+
         const route = await fetchFootRoute(
           location,
           destination,
           controller.signal
         );
 
-        if (unmountedRef.current) return;
+        if (
+          unmountedRef.current ||
+          currentRequest !== requestIdRef.current
+        ) {
+          return;
+        }
 
         progressRef.current = 0;
-        setGuide({ destKey, source: 'route', ...route });
+
+        setGuide({
+          destKey,
+          source: 'route',
+          ...route,
+        });
       } catch (error) {
-        if (unmountedRef.current) return;
+        if (
+          unmountedRef.current ||
+          currentRequest !== requestIdRef.current
+        ) {
+          return;
+        }
 
         const offlineRoute = buildRouteMetrics(
-          trail?.routeCoordinates
+          downloadedTrail?.routeCoordinates ?? trail?.routeCoordinates,
+          downloadedTrail?.routeDurationS ?? 0
         );
 
-        setGuide((previous) => {
-          if (
-            previous &&
-            previous.destKey === destKey &&
-            previous.source === 'route'
-          ) {
-            return previous;
-          }
+        if (offlineRoute) {
+          progressRef.current = 0;
 
-          if (offlineRoute) {
-            progressRef.current = 0;
-            return {
-              destKey,
-              source: 'gpx',
-              ...offlineRoute,
-            };
-          }
-
-          return {
+          setGuide({
+            destKey,
+            source: 'gpx',
+            ...offlineRoute,
+          });
+        } else {
+          setGuide({
             destKey,
             source: 'straight',
             coordinates: [],
             cumulative: [],
             totalM: 0,
             durationS: 0,
-          };
-        });
-
-        clearTimeout(retryTimerRef.current);
-        retryTimerRef.current = setTimeout(
-          () => setRetryTick((tick) => tick + 1),
-          STRAIGHT_RETRY_MS + 200
-        );
+          });
+        }
       } finally {
         clearTimeout(timeout);
-        state.inFlight = false;
 
-        if (!unmountedRef.current) {
+        if (
+          !unmountedRef.current &&
+          currentRequest === requestIdRef.current
+        ) {
           setGuideLoading(false);
-          setRetryTick((tick) => tick + 1);
         }
       }
-    })();
+    }
+
+    loadRoute();
+
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
   }, [
-    location,
-    destination,
+    location?.latitude,
+    location?.longitude,
+    destination?.latitude,
+    destination?.longitude,
     destKey,
+    isOnline,
+    downloadedTrail,
     trail,
-    activeGuide,
-    guideInfo,
-    accuracy,
     arrived,
-    retryTick,
   ]);
 
-  const collectFramePoints = useCallback(() => {
-    const points = [];
-
-    if (destination) points.push(destination);
-    if (location) points.push(location);
-
-    if (
-      guideInfo &&
-      !arrived &&
-      guideInfo.line.length >= 2
-    ) {
-      points.push(...guideInfo.line);
-    }
-
-    return points;
-  }, [destination, location, guideInfo, arrived]);
-
-  useEffect(() => {
-    if (!mapReady || !mapRef.current || !trailId) return;
-
-    if (!location && !locationError) return;
-
-    const frameKey = `${trailId}|${location ? 'gps' : 'nogps'}|${
-      activeGuide ? activeGuide.source : 'none'
-    }`;
-
-    if (lastFramedTrailRef.current === frameKey) return;
-
-    const points = collectFramePoints();
-
-    if (points.length >= 2) {
-      mapRef.current.fitToCoordinates(points, {
-        edgePadding: {
-          top: 90,
-          right: 55,
-          bottom: 170,
-          left: 55,
-        },
-        animated: true,
-      });
-    } else if (points.length === 1) {
-      mapRef.current.animateToRegion(
-        {
-          ...points[0],
-          latitudeDelta: 0.02,
-          longitudeDelta: 0.02,
-        },
-        500
-      );
-    } else {
-      return;
-    }
-
-    lastFramedTrailRef.current = frameKey;
-  }, [
-    mapReady,
-    trailId,
-    location,
-    locationError,
-    activeGuide,
-    collectFramePoints,
-  ]);
+  const guideIsRoute = ['route', 'gpx'].includes(activeGuide?.source);
+  const guideIsGpx = activeGuide?.source === 'gpx';
+  const guideIsStraight = activeGuide?.source === 'straight';
 
   const centerOnCurrentLocation = useCallback(() => {
     if (!location || !mapRef.current) return;
 
-    mapRef.current.animateToRegion(
-      {
-        ...location,
-        latitudeDelta: 0.008,
-        longitudeDelta: 0.008,
-      },
-      500
-    );
+    mapRef.current.flyTo({
+      center: toLngLat(location),
+      zoom: deltaToZoom(0.008),
+      duration: 500,
+    });
   }, [location]);
 
   const frameSelectedTrail = useCallback(() => {
     if (!mapRef.current) return;
 
-    const points = collectFramePoints();
-
-    if (points.length >= 2) {
-      mapRef.current.fitToCoordinates(points, {
-        edgePadding: {
-          top: 90,
-          right: 55,
-          bottom: 170,
-          left: 55,
-        },
-        animated: true,
+    if (location && destination) {
+      fitCamera(mapRef.current, [location, destination], {
+        top: 90,
+        right: 55,
+        bottom: 200,
+        left: 55,
       });
     } else if (destination) {
-      mapRef.current.animateToRegion(
-        {
-          ...destination,
-          latitudeDelta: 0.02,
-          longitudeDelta: 0.02,
-        },
-        500
-      );
+      mapRef.current.flyTo({
+        center: toLngLat(destination),
+        zoom: deltaToZoom(0.02),
+        duration: 500,
+      });
     } else if (location) {
-      mapRef.current.animateToRegion(
-        {
-          ...location,
-          latitudeDelta: 0.02,
-          longitudeDelta: 0.02,
-        },
-        500
-      );
+      centerOnCurrentLocation();
     }
-  }, [collectFramePoints, destination, location]);
+  }, [location, destination, centerOnCurrentLocation]);
+
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+
+    const currentLocation = latestFixRef.current;
+
+    if (hasLocation && currentLocation && destination) {
+      fitCamera(
+        mapRef.current,
+        guideInfo?.line?.length > 1
+          ? guideInfo.line
+          : [currentLocation, destination],
+        {
+          top: 90,
+          right: 55,
+          bottom: 210,
+          left: 55,
+        }
+      );
+    } else if (destination) {
+      mapRef.current.flyTo({
+        center: toLngLat(destination),
+        zoom: deltaToZoom(0.02),
+        duration: 500,
+      });
+    }
+  }, [mapReady, trailId, hasLocation, destination, guideInfo?.line?.length]);
+
+  // GeoJSON for the map layers (kept above the early returns below so the
+  // hook order never changes).
+  const guideLineData = useMemo(
+    () => lineFeature(guideInfo?.line),
+    [guideInfo?.line]
+  );
+  const recLineData = useMemo(() => lineFeature(recPoints), [recPoints]);
+  const accuracyData = useMemo(
+    () =>
+      circleFeature(
+        location,
+        Math.min(Math.max(accuracy ?? 8, 5), 100)
+      ),
+    [location, accuracy]
+  );
 
   if (!trailId) {
     return (
@@ -1139,19 +1354,15 @@ export default function LiveTopoScreen() {
         <MaterialCommunityIcons
           name="map-marker-path"
           size={54}
-          color={ORANGE}
+          color={COLORS.primary}
         />
-
         <Text style={styles.emptyTitle}>No trail selected</Text>
-
         <Text style={styles.emptyDescription}>
           Open Maps and select a trail to view it here.
         </Text>
-
         <TouchableOpacity
           style={styles.primaryButton}
           onPress={() => router.push('/maps')}
-          activeOpacity={0.85}
         >
           <Text style={styles.primaryButtonText}>Go to Maps</Text>
         </TouchableOpacity>
@@ -1159,11 +1370,10 @@ export default function LiveTopoScreen() {
     );
   }
 
-  if (!trail && trails.length === 0) {
+  if (!trail && trails.length === 0 && !downloadedTrail) {
     return (
       <SafeAreaView style={styles.emptyContainer}>
-        <ActivityIndicator size="large" color={ORANGE} />
-
+        <ActivityIndicator size="large" color={COLORS.primary} />
         <Text style={styles.emptyDescription}>
           Loading trail information…
         </Text>
@@ -1177,33 +1387,46 @@ export default function LiveTopoScreen() {
         <MaterialCommunityIcons
           name="map-marker-question-outline"
           size={50}
-          color={MUTED}
+          color={COLORS.muted}
         />
-
         <Text style={styles.emptyTitle}>Trail not found</Text>
-
         <Text style={styles.emptyDescription}>
-          The selected trail could not be found in your trail data.
+          This trail is not in the current trail list. Open Maps while online
+          to load the trail information.
         </Text>
+
+        {downloadedTrail && (
+          <TouchableOpacity
+            style={styles.deleteDownloadButton}
+            onPress={deleteDownloadedTrail}
+            disabled={deletingTrail}
+          >
+            {deletingTrail ? (
+              <ActivityIndicator color={COLORS.red} />
+            ) : (
+              <>
+                <MaterialCommunityIcons
+                  name="delete-outline"
+                  size={20}
+                  color={COLORS.red}
+                />
+                <Text style={styles.deleteDownloadButtonText}>
+                  Delete Offline Download
+                </Text>
+              </>
+            )}
+          </TouchableOpacity>
+        )}
 
         <TouchableOpacity
           style={styles.primaryButton}
           onPress={() => router.push('/maps')}
-          activeOpacity={0.85}
         >
-          <Text style={styles.primaryButtonText}>
-            Choose Another Trail
-          </Text>
+          <Text style={styles.primaryButtonText}>Choose Another Trail</Text>
         </TouchableOpacity>
       </SafeAreaView>
     );
   }
-
-  const guideIsRoute = ['route', 'gpx'].includes(
-    activeGuide?.source
-  );
-  const guideIsGpx = activeGuide?.source === 'gpx';
-  const guideIsStraight = activeGuide?.source === 'straight';
 
   const elapsedMs =
     recStatus === 'idle'
@@ -1215,12 +1438,12 @@ export default function LiveTopoScreen() {
 
   const badge =
     recStatus === 'recording'
-      ? { color: RED, label: `RECORDING · ${formatClock(elapsedMs)}` }
+      ? { color: COLORS.red, label: `RECORDING · ${formatClock(elapsedMs)}` }
       : recStatus === 'paused'
-        ? { color: AMBER, label: `PAUSED · ${formatClock(elapsedMs)}` }
+        ? { color: COLORS.amber, label: `PAUSED · ${formatClock(elapsedMs)}` }
         : recStatus === 'finished'
-          ? { color: DARK_GREEN, label: 'TRACK READY TO SAVE' }
-          : { color: ORANGE, label: 'LIVE TOPO GUIDE' };
+          ? { color: COLORS.green, label: 'TRACK READY TO SAVE' }
+          : { color: COLORS.primary, label: 'LIVE TOPO GUIDE' };
 
   const ascentLabel =
     recStats.ascentM === null
@@ -1233,147 +1456,157 @@ export default function LiveTopoScreen() {
       edges={['top', 'left', 'right']}
     >
       <View style={styles.mapContainer}>
-        
-<MapView
-  ref={mapRef}
-  style={styles.map}
-  mapType="hybrid"
-  initialRegion={
-    destination
-      ? {
-          ...destination,
-          latitudeDelta: 0.025,
-          longitudeDelta: 0.025,
-        }
-      : DEFAULT_REGION
-  }
-  onMapReady={() => setMapReady(true)}
-  showsUserLocation={false}
-  showsMyLocationButton={false}
-  showsCompass
-  toolbarEnabled={false}
-  loadingEnabled
->
-  {guideInfo &&
-    !arrived &&
-    guideInfo.line.length >= 2 &&
-    (guideIsRoute ? (
-      <>
-        <Polyline
-          coordinates={guideInfo.line}
-          strokeColor="#FFFFFF"
-          strokeWidth={9}
-          lineCap="round"
-          lineJoin="round"
-          zIndex={3}
-        />
+        <MapLibreMap
+          style={styles.map}
+          mapStyle={OSM_STYLE}
+          onDidFinishLoadingMap={() => setMapReady(true)}
+          logo={false}
+          attribution
+        >
+          <Camera
+            ref={mapRef}
+            initialViewState={{
+              center: toLngLat(destination ?? DEFAULT_REGION),
+              zoom: destination
+                ? deltaToZoom(0.025)
+                : deltaToZoom(DEFAULT_REGION.latitudeDelta),
+            }}
+          />
 
-        <Polyline
-          coordinates={guideInfo.line}
-          strokeColor={BLUE}
-          strokeWidth={5}
-          lineCap="round"
-          lineJoin="round"
-          zIndex={4}
-        />
-      </>
-    ) : (
-      <Polyline
-        coordinates={guideInfo.line}
-        strokeColor={BLUE}
-        strokeWidth={4}
-        lineDashPattern={[14, 10]}
-        zIndex={4}
-      />
-    ))}
+          {/*
+            Sources and layers are ALWAYS rendered with fixed ids and only
+            their data/opacity changes. MapLibre drops falsy children before
+            rendering, so conditionally adding or removing a <Layer> shifts
+            the remaining layers and crashes with "`id` cannot be changed".
+          */}
+          <GeoJSONSource
+            id="guide-line"
+            data={
+              guideInfo && !arrived ? guideLineData : EMPTY_COLLECTION
+            }
+          >
+            <Layer
+              key="guide-line-casing"
+              id="guide-line-casing"
+              type="line"
+              layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              paint={{
+                'line-color': '#FFFFFF',
+                'line-width': 9,
+                'line-opacity': guideIsRoute ? 1 : 0,
+              }}
+            />
+            <Layer
+              key="guide-line-route"
+              id="guide-line-route"
+              type="line"
+              layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              paint={{
+                'line-color': COLORS.blue,
+                'line-width': 5,
+                'line-opacity': guideIsRoute ? 1 : 0,
+              }}
+            />
+            <Layer
+              key="guide-line-straight"
+              id="guide-line-straight"
+              type="line"
+              paint={{
+                'line-color': COLORS.blue,
+                'line-width': 4,
+                'line-dasharray': [3.5, 2.5],
+                'line-opacity': guideIsRoute ? 0 : 1,
+              }}
+            />
+          </GeoJSONSource>
 
-  {recPoints.length >= 2 && (
-    <>
-      <Polyline
-        coordinates={recPoints}
-        strokeColor="#FFFFFF"
-        strokeWidth={9}
-        lineCap="round"
-        lineJoin="round"
-        zIndex={5}
-      />
+          <GeoJSONSource id="rec-line" data={recLineData}>
+            <Layer
+              key="rec-line-casing"
+              id="rec-line-casing"
+              type="line"
+              layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              paint={{ 'line-color': '#FFFFFF', 'line-width': 9 }}
+            />
+            <Layer
+              key="rec-line-main"
+              id="rec-line-main"
+              type="line"
+              layout={{ 'line-cap': 'round', 'line-join': 'round' }}
+              paint={{ 'line-color': COLORS.red, 'line-width': 5 }}
+            />
+          </GeoJSONSource>
 
-      <Polyline
-        coordinates={recPoints}
-        strokeColor={RED}
-        strokeWidth={5}
-        lineCap="round"
-        lineJoin="round"
-        zIndex={6}
-      />
-    </>
-  )}
+          <GeoJSONSource id="accuracy-circle" data={accuracyData}>
+            <Layer
+              key="accuracy-fill"
+              id="accuracy-fill"
+              type="fill"
+              paint={{
+                'fill-color': '#22C55E',
+                'fill-opacity': 0.18,
+              }}
+            />
+            <Layer
+              key="accuracy-outline"
+              id="accuracy-outline"
+              type="line"
+              paint={{
+                'line-color': '#22C55E',
+                'line-opacity': 0.65,
+                'line-width': 1,
+              }}
+            />
+          </GeoJSONSource>
 
-  {destination && (
-    <Marker
-      coordinate={destination}
-      title={trail.name || trail.title || 'Selected trail'}
-      description="Selected hiking destination"
-      pinColor={ORANGE}
-    />
-  )}
+          {destination && (
+            <Marker lngLat={toLngLat(destination)} anchor="bottom">
+              <MaterialCommunityIcons
+                name="map-marker"
+                size={42}
+                color="#FF8A00"
+              />
+            </Marker>
+          )}
 
-  {location && (
-    <>
-      <Circle
-        center={location}
-        radius={Math.min(Math.max(accuracy ?? 8, 5), 100)}
-        fillColor="rgba(34, 197, 94, 0.18)"
-        strokeColor="rgba(34, 197, 94, 0.65)"
-        strokeWidth={1}
-      />
-
-      <UserMarker coordinate={location} />
-    </>
-  )}
-</MapView>
-
+          {location && <UserMarker coordinate={location} />}
+        </MapLibreMap>
 
         <View style={styles.mapButtons}>
           <TouchableOpacity
             style={styles.mapButton}
             onPress={centerOnCurrentLocation}
-            activeOpacity={0.8}
             accessibilityLabel="Center on my location"
           >
             <MaterialCommunityIcons
               name="crosshairs-gps"
               size={23}
-              color={GREEN}
+              color={COLORS.primary}
             />
           </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.mapButton}
             onPress={frameSelectedTrail}
-            activeOpacity={0.8}
             accessibilityLabel="Show the selected trail route"
           >
             <MaterialCommunityIcons
               name="map-marker-path"
               size={23}
-              color={ORANGE}
+              color={COLORS.primary}
             />
           </TouchableOpacity>
         </View>
 
         <View style={styles.trailBadge}>
-          <View
-            style={[styles.badgeDot, { backgroundColor: badge.color }]}
-          />
-
+          <View style={[styles.badgeDot, { backgroundColor: badge.color }]} />
           <View style={styles.trailBadgeTextContainer}>
             <Text style={styles.trailBadgeTitle} numberOfLines={1}>
               {trail.name || trail.title || 'Selected Trail'}
             </Text>
-
+            <Text style={styles.trailBadgeSubtitle}>{badge.label}</Text>
             <Text style={styles.trailBadgeSubtitle}>
-              {badge.label}
+              {isOnline ? 'OPENSTREETMAP' : 'OFFLINE · MAP TILES MAY BE MISSING'}
             </Text>
           </View>
         </View>
@@ -1383,14 +1616,12 @@ export default function LiveTopoScreen() {
             <View style={styles.legendBlueLine} />
             <Text style={styles.legendText}>Walking route</Text>
           </View>
-
           {recPoints.length > 0 && (
             <View style={styles.legendRow}>
               <View style={styles.legendRedLine} />
               <Text style={styles.legendText}>Recorded track</Text>
             </View>
           )}
-
           <View style={styles.legendRow}>
             <View style={styles.legendGreenDot} />
             <Text style={styles.legendText}>Your GPS location</Text>
@@ -1398,378 +1629,411 @@ export default function LiveTopoScreen() {
         </View>
       </View>
 
-      {isTrailPanelVisible ? (
+      {panelVisible ? (
         <View style={styles.bottomPanel}>
           <View
             style={styles.panelHandleTouchArea}
             {...panelPanResponder.panHandlers}
-            accessibilityRole="button"
-            accessibilityLabel="Swipe down to hide Trail Guide"
           >
             <View style={styles.panelHandle} />
           </View>
 
-          <View style={styles.panelHeadingRow}>
-            <View style={styles.panelIcon}>
-              <MaterialCommunityIcons
-                name="terrain"
-                size={24}
-                color={ORANGE}
-              />
-            </View>
-
-            <View style={styles.panelTitleContainer}>
-              <Text style={styles.panelTitle}>Trail Guide</Text>
-
-              <Text style={styles.panelSubtitle} numberOfLines={1}>
-                {trail.name || trail.title || 'Selected hiking trail'}
-              </Text>
-            </View>
-
-            <View
-              style={[
-                styles.statusPill,
-                location
-                  ? styles.statusPillActive
-                  : styles.statusPillInactive,
-              ]}
-            >
-              <View
-                style={[
-                  styles.statusDot,
-                  { backgroundColor: location ? GREEN : '#9CA3AF' },
-                ]}
-              />
-
-              <Text style={styles.statusText}>
-                {location
-                  ? accuracy != null
-                    ? `GPS Active · ±${Math.round(accuracy)} m`
-                    : 'GPS Active'
-                  : 'GPS Waiting'}
-              </Text>
-            </View>
-          </View>
-
-          {locationLoading && (
-            <View style={styles.messageRow}>
-              <ActivityIndicator size="small" color={ORANGE} />
-
-              <Text style={styles.messageText}>
-                Getting your current location…
-              </Text>
-            </View>
-          )}
-
-          {!!locationError && (
-            <View style={styles.warningBox}>
-              <MaterialCommunityIcons
-                name="map-marker-alert-outline"
-                size={20}
-                color="#B45309"
-              />
-
-              <Text style={styles.warningText}>{locationError}</Text>
-            </View>
-          )}
-
-          {arrived ? (
-            <View style={[styles.guideCard, styles.guideCardArrived]}>
-              <View
-                style={[
-                  styles.guideCardIcon,
-                  styles.guideCardIconArrived,
-                ]}
-              >
+          <ScrollView
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={styles.panelContent}
+          >
+            <View style={styles.panelHeadingRow}>
+              <View style={styles.panelIcon}>
                 <MaterialCommunityIcons
-                  name="flag-checkered"
-                  size={22}
-                  color={DARK_GREEN}
+                  name="terrain"
+                  size={24}
+                  color={COLORS.primary}
                 />
               </View>
 
-              <View style={styles.guideCardText}>
-                <Text style={styles.guideCardTitle}>
-                  You have arrived
+              <View style={styles.panelTitleContainer}>
+                <Text style={styles.panelTitle}>Trail Guide</Text>
+                <Text style={styles.panelSubtitle} numberOfLines={1}>
+                  {trail.name || trail.title || 'Selected hiking trail'}
                 </Text>
-                <Text style={styles.guideCardSub}>
-                  You are at the destination.
+              </View>
+
+              <View
+                style={[
+                  styles.statusPill,
+                  location
+                    ? styles.statusPillActive
+                    : styles.statusPillInactive,
+                ]}
+              >
+                <View
+                  style={[
+                    styles.statusDot,
+                    {
+                      backgroundColor: location
+                        ? COLORS.green
+                        : '#9CA3AF',
+                    },
+                  ]}
+                />
+                <Text style={styles.statusText}>
+                  {location
+                    ? accuracy != null
+                      ? `GPS Active · ±${Math.round(accuracy)} m`
+                      : 'GPS Active'
+                    : 'GPS Waiting'}
                 </Text>
               </View>
             </View>
-          ) : guideInfo && guideIsRoute ? (
-            <View style={styles.guideCard}>
-              <View style={styles.guideCardIcon}>
+
+            {locationLoading && (
+              <View style={styles.messageRow}>
+                <ActivityIndicator size="small" color={COLORS.primary} />
+                <Text style={styles.messageText}>
+                  Getting your current location…
+                </Text>
+              </View>
+            )}
+
+            {!!locationError && (
+              <View style={styles.warningBox}>
+                <MaterialCommunityIcons
+                  name="map-marker-alert-outline"
+                  size={20}
+                  color="#B45309"
+                />
+                <Text style={styles.warningText}>{locationError}</Text>
+              </View>
+            )}
+
+            {arrived ? (
+              <View style={[styles.guideCard, styles.guideCardArrived]}>
+                <MaterialCommunityIcons
+                  name="flag-checkered"
+                  size={23}
+                  color={COLORS.green}
+                />
+                <View style={styles.guideCardText}>
+                  <Text style={styles.guideCardTitle}>You have arrived</Text>
+                  <Text style={styles.guideCardSub}>
+                    You are at the destination.
+                  </Text>
+                </View>
+              </View>
+            ) : guideInfo && guideIsRoute ? (
+              <View style={styles.guideCard}>
                 <MaterialCommunityIcons
                   name="navigation-variant-outline"
-                  size={22}
-                  color={BLUE}
+                  size={23}
+                  color={COLORS.blue}
                 />
+                <View style={styles.guideCardText}>
+                  <Text style={styles.guideCardTitle}>
+                    {formatDistance(guideInfo.remainingM)} to go
+                  </Text>
+                  <Text style={styles.guideCardSub}>
+                    {guideIsGpx
+                      ? 'Offline saved route · follow with care'
+                      : `About ${formatDuration(guideInfo.etaS)} on foot`}
+                  </Text>
+                </View>
               </View>
-
-              <View style={styles.guideCardText}>
-                <Text style={styles.guideCardTitle}>
-                  {formatDistance(guideInfo.remainingM)} to go
-                </Text>
-                <Text style={styles.guideCardSub}>
-                  {guideIsGpx
-                    ? 'Offline saved trail track · follow with care'
-                    : `About ${formatDuration(guideInfo.etaS)} on foot`}
+            ) : guideInfo && guideIsStraight ? (
+              <View style={styles.warningBox}>
+                <MaterialCommunityIcons
+                  name="vector-line"
+                  size={20}
+                  color="#B45309"
+                />
+                <Text style={styles.warningText}>
+                  Walking route unavailable. Showing a straight line,
+                  {` ${formatDistance(guideInfo.remainingM)} away.`}
                 </Text>
               </View>
-            </View>
-          ) : guideInfo && guideIsStraight ? (
-            <View style={styles.warningBox}>
-              <MaterialCommunityIcons
-                name="vector-line"
-                size={20}
-                color="#B45309"
-              />
+            ) : location && guideLoading ? (
+              <View style={styles.messageRow}>
+                <ActivityIndicator size="small" color={COLORS.blue} />
+                <Text style={styles.messageText}>
+                  Finding the walking route…
+                </Text>
+              </View>
+            ) : null}
 
-              <Text style={styles.warningText}>
-                Walking route unavailable right now. Showing a straight
-                line, {formatDistance(guideInfo.remainingM)} away.
-                Retrying automatically.
-              </Text>
-            </View>
-          ) : location && guideLoading ? (
-            <View style={styles.messageRow}>
-              <ActivityIndicator size="small" color={BLUE} />
-
-              <Text style={styles.messageText}>
-                Finding the walking route…
-              </Text>
-            </View>
-          ) : null}
-
-          {recStatus === 'idle' && (
-            <>
+            <View style={styles.downloadSection}>
               <TouchableOpacity
                 style={[
-                  styles.primaryButton,
-                  !location && styles.buttonDisabled,
+                  styles.downloadButton,
+                  !canDownloadRoute && styles.buttonDisabled,
                 ]}
-                onPress={startRecording}
-                disabled={!location}
+                onPress={downloadCurrentRoute}
+                disabled={!canDownloadRoute || downloadingTrail}
                 activeOpacity={0.85}
-                accessibilityLabel="Start recording your track"
+                accessibilityRole="button"
+                accessibilityLabel="Download route for offline use"
               >
-                <MaterialCommunityIcons
-                  name="record-circle-outline"
-                  size={22}
-                  color="#F87171"
-                />
-
-                <Text style={styles.primaryButtonText}>
-                  Start Recording
-                </Text>
+                {downloadingTrail ? (
+                  <ActivityIndicator color={COLORS.primary} />
+                ) : (
+                  <>
+                    <MaterialCommunityIcons
+                      name={
+                        downloadedTrail
+                          ? 'download-circle-outline'
+                          : 'download'
+                      }
+                      size={21}
+                      color={
+                        canDownloadRoute ? COLORS.primary : '#9CA3AF'
+                      }
+                    />
+                    <Text
+                      style={[
+                        styles.downloadButtonText,
+                        !canDownloadRoute &&
+                          styles.downloadButtonTextDisabled,
+                      ]}
+                    >
+                      {downloadedTrail
+                        ? 'Update Offline Route'
+                        : 'Download Trail'}
+                    </Text>
+                  </>
+                )}
               </TouchableOpacity>
 
-              <Text style={styles.helperText}>
-                {location
-                  ? 'Record your hike, then save or discard it when you finish.'
-                  : 'Waiting for GPS before you can record.'}
-              </Text>
-            </>
-          )}
-
-          {(recStatus === 'recording' || recStatus === 'paused') && (
-            <>
-              <View style={styles.statsRow}>
-                <Stat
-                  label="Distance"
-                  value={formatDistance(recStats.distanceM)}
-                />
-
-                <Stat
-                  label="Time"
-                  value={formatClock(elapsedMs)}
-                  divider
-                />
-
-                <Stat
-                  label="Ascent"
-                  value={ascentLabel}
-                  divider
-                />
-              </View>
-
-              <View style={styles.buttonRow}>
-                {recStatus === 'recording' ? (
-                  <TouchableOpacity
-                    style={[styles.actionButton, styles.outlineButton]}
-                    onPress={pauseRecording}
-                    activeOpacity={0.85}
-                    accessibilityLabel="Pause recording"
-                  >
-                    <MaterialCommunityIcons
-                      name="pause"
-                      size={21}
-                      color={DARK}
-                    />
-
-                    <Text style={styles.outlineButtonText}>Pause</Text>
-                  </TouchableOpacity>
-                ) : (
-                  <TouchableOpacity
-                    style={[styles.actionButton, styles.greenButton]}
-                    onPress={resumeRecording}
-                    activeOpacity={0.85}
-                    accessibilityLabel="Resume recording"
-                  >
-                    <MaterialCommunityIcons
-                      name="play"
-                      size={21}
-                      color="#FFFFFF"
-                    />
-
-                    <Text style={styles.primaryButtonText}>Resume</Text>
-                  </TouchableOpacity>
-                )}
-
-                <TouchableOpacity
-                  style={[styles.actionButton, styles.redButton]}
-                  onPress={stopRecording}
-                  activeOpacity={0.85}
-                  accessibilityLabel="Stop recording"
-                >
-                  <MaterialCommunityIcons
-                    name="stop"
-                    size={21}
-                    color="#FFFFFF"
-                  />
-
-                  <Text style={styles.primaryButtonText}>Stop</Text>
-                </TouchableOpacity>
-              </View>
-            </>
-          )}
-
-          {recStatus === 'finished' && (
-            <>
-              <View style={styles.summaryHeader}>
-                <MaterialCommunityIcons
-                  name="flag-checkered"
-                  size={18}
-                  color={DARK_GREEN}
-                />
-
-                <Text style={styles.summaryTitle}>
-                  Recording finished
+              {!canDownloadRoute && (
+                <Text style={styles.downloadHelperText}>
+                  Download becomes available when a solid blue route appears.
                 </Text>
-
-                <Text style={styles.summarySub}>
-                  {recPoints.length} GPS points
-                </Text>
-              </View>
-
-              <View style={styles.statsRow}>
-                <Stat
-                  label="Distance"
-                  value={formatDistance(recStats.distanceM)}
-                />
-
-                <Stat
-                  label="Time"
-                  value={formatClock(elapsedMs)}
-                  divider
-                />
-
-                <Stat
-                  label="Ascent"
-                  value={ascentLabel}
-                  divider
-                />
-              </View>
-
-              {!!saveError && (
-                <View style={styles.warningBox}>
-                  <MaterialCommunityIcons
-                    name="alert-circle-outline"
-                    size={20}
-                    color="#B45309"
-                  />
-
-                  <Text style={styles.warningText}>{saveError}</Text>
-                </View>
               )}
 
-              <View style={styles.buttonRow}>
+              {downloadedTrail && (
                 <TouchableOpacity
                   style={[
-                    styles.actionButton,
-                    styles.greenButton,
-                    saving && styles.buttonDisabled,
+                    styles.deleteDownloadButton,
+                    deletingTrail && styles.buttonDisabled,
                   ]}
-                  onPress={saveRecording}
-                  disabled={saving}
+                  onPress={deleteDownloadedTrail}
+                  disabled={deletingTrail}
                   activeOpacity={0.85}
-                  accessibilityLabel="Save this track"
                 >
-                  {saving ? (
-                    <ActivityIndicator color="#FFFFFF" />
+                  {deletingTrail ? (
+                    <ActivityIndicator color={COLORS.red} />
                   ) : (
                     <>
                       <MaterialCommunityIcons
-                        name="content-save-outline"
+                        name="delete-outline"
                         size={20}
-                        color="#FFFFFF"
+                        color={COLORS.red}
                       />
-
-                      <Text style={styles.primaryButtonText}>
-                        Save Track
+                      <Text style={styles.deleteDownloadButtonText}>
+                        Delete Download
                       </Text>
                     </>
                   )}
                 </TouchableOpacity>
+              )}
+            </View>
 
+            {recStatus === 'idle' && (
+              <>
                 <TouchableOpacity
                   style={[
-                    styles.actionButton,
-                    styles.discardButton,
-                    saving && styles.buttonDisabled,
+                    styles.primaryButton,
+                    !location && styles.buttonDisabled,
                   ]}
-                  onPress={discardRecording}
-                  disabled={saving}
-                  activeOpacity={0.85}
-                  accessibilityLabel="Discard this track"
+                  onPress={startRecording}
+                  disabled={!location}
                 >
                   <MaterialCommunityIcons
-                    name="trash-can-outline"
-                    size={20}
-                    color={RED}
+                    name="record-circle-outline"
+                    size={22}
+                    color="#F87171"
                   />
-
-                  <Text style={styles.discardButtonText}>Discard</Text>
+                  <Text style={styles.primaryButtonText}>
+                    Start Recording
+                  </Text>
                 </TouchableOpacity>
-              </View>
-            </>
-          )}
+                <Text style={styles.helperText}>
+                  {location
+                    ? 'Record your hike, then save or discard it when you finish.'
+                    : 'Waiting for GPS before you can record.'}
+                </Text>
+              </>
+            )}
 
-          {guideIsRoute && !guideIsGpx && (
-            <Text style={styles.attribution}>
-              Route data © OpenStreetMap contributors · Routing by OSRM
-            </Text>
-          )}
+            {(recStatus === 'recording' || recStatus === 'paused') && (
+              <>
+                <View style={styles.statsRow}>
+                  <Stat
+                    label="Distance"
+                    value={formatDistance(recStats.distanceM)}
+                  />
+                  <Stat
+                    label="Time"
+                    value={formatClock(elapsedMs)}
+                    divider
+                  />
+                  <Stat
+                    label="Ascent"
+                    value={ascentLabel}
+                    divider
+                  />
+                </View>
 
-          {guideIsGpx && (
-            <Text style={styles.attribution}>
-              Offline saved route · verify the track before hiking
-            </Text>
-          )}
+                <View style={styles.buttonRow}>
+                  {recStatus === 'recording' ? (
+                    <TouchableOpacity
+                      style={[styles.actionButton, styles.outlineButton]}
+                      onPress={pauseRecording}
+                    >
+                      <MaterialCommunityIcons
+                        name="pause"
+                        size={21}
+                        color={COLORS.text}
+                      />
+                      <Text style={styles.outlineButtonText}>Pause</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity
+                      style={[styles.actionButton, styles.greenButton]}
+                      onPress={resumeRecording}
+                    >
+                      <MaterialCommunityIcons
+                        name="play"
+                        size={21}
+                        color={COLORS.white}
+                      />
+                      <Text style={styles.primaryButtonText}>Resume</Text>
+                    </TouchableOpacity>
+                  )}
+
+                  <TouchableOpacity
+                    style={[styles.actionButton, styles.redButton]}
+                    onPress={stopRecording}
+                  >
+                    <MaterialCommunityIcons
+                      name="stop"
+                      size={21}
+                      color={COLORS.white}
+                    />
+                    <Text style={styles.primaryButtonText}>Stop</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+
+            {recStatus === 'finished' && (
+              <>
+                <View style={styles.summaryHeader}>
+                  <MaterialCommunityIcons
+                    name="flag-checkered"
+                    size={18}
+                    color={COLORS.green}
+                  />
+                  <Text style={styles.summaryTitle}>Recording finished</Text>
+                  <Text style={styles.summarySub}>
+                    {recPoints.length} GPS points
+                  </Text>
+                </View>
+
+                <View style={styles.statsRow}>
+                  <Stat
+                    label="Distance"
+                    value={formatDistance(recStats.distanceM)}
+                  />
+                  <Stat
+                    label="Time"
+                    value={formatClock(elapsedMs)}
+                    divider
+                  />
+                  <Stat
+                    label="Ascent"
+                    value={ascentLabel}
+                    divider
+                  />
+                </View>
+
+                {!!saveError && (
+                  <View style={styles.warningBox}>
+                    <MaterialCommunityIcons
+                      name="alert-circle-outline"
+                      size={20}
+                      color="#B45309"
+                    />
+                    <Text style={styles.warningText}>{saveError}</Text>
+                  </View>
+                )}
+
+                <View style={styles.buttonRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.actionButton,
+                      styles.greenButton,
+                      saving && styles.buttonDisabled,
+                    ]}
+                    onPress={() => persistRecording('completed')}
+                    disabled={saving}
+                  >
+                    {saving ? (
+                      <ActivityIndicator color={COLORS.white} />
+                    ) : (
+                      <>
+                        <MaterialCommunityIcons
+                          name="content-save-outline"
+                          size={20}
+                          color={COLORS.white}
+                        />
+                        <Text style={styles.primaryButtonText}>
+                          Save Track
+                        </Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[
+                      styles.actionButton,
+                      styles.discardButton,
+                      saving && styles.buttonDisabled,
+                    ]}
+                    onPress={discardRecording}
+                    disabled={saving}
+                  >
+                    <MaterialCommunityIcons
+                      name="trash-can-outline"
+                      size={20}
+                      color={COLORS.red}
+                    />
+                    <Text style={styles.discardButtonText}>Discard</Text>
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+
+            {guideIsRoute && !guideIsGpx && (
+              <Text style={styles.attribution}>
+                Route data © OpenStreetMap contributors · Routing by OSRM
+              </Text>
+            )}
+
+            {guideIsGpx && (
+              <Text style={styles.attribution}>
+                Offline saved route · verify the track before hiking
+              </Text>
+            )}
+          </ScrollView>
         </View>
       ) : (
         <TouchableOpacity
           style={styles.showPanelButton}
-          onPress={() => setIsTrailPanelVisible(true)}
+          onPress={() => setPanelVisible(true)}
           activeOpacity={0.85}
-          accessibilityRole="button"
-          accessibilityLabel="Show Trail Guide"
         >
           <MaterialCommunityIcons
             name="chevron-up"
             size={22}
-            color={DARK}
+            color={COLORS.primary}
           />
           <Text style={styles.showPanelButtonText}>Trail Guide</Text>
         </TouchableOpacity>
@@ -2276,5 +2540,55 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 9,
     marginBottom: 22,
+  },
+
+  downloadSection: {
+  marginTop: 10,
+  marginBottom: 4,
+  },
+
+  downloadButton: {
+    minHeight: 48,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#C9AD8A',
+    backgroundColor: '#F7F0E6',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+    paddingHorizontal: 16,
+  },
+  downloadButtonText: {
+    color: '#694F2E',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  downloadButtonTextDisabled: {
+    color: '#9CA3AF',
+  },
+  downloadHelperText: {
+    color: '#66736B',
+    fontSize: 11,
+    textAlign: 'center',
+    marginTop: 6,
+  },
+  deleteDownloadButton: {
+    minHeight: 42,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#FECACA',
+    backgroundColor: '#FEF2F2',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    marginTop: 8,
+  },
+  deleteDownloadButtonText: {
+    color: '#DC2626',
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

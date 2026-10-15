@@ -1,5 +1,5 @@
-
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import { Camera, Map, Marker } from '@maplibre/maplibre-react-native';
 import * as Location from 'expo-location';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import {
@@ -19,11 +19,11 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import MapView from 'react-native-maps';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { TrailMarker } from '../../components/TrailBubble';
 import TrailSheet from '../../components/TrailSheet';
+import { OSM_STYLE } from '../../constants/mapStyle';
 import { INITIAL_REGION } from '../../constants/trailConfig';
 import { useTrails } from '../../hooks/useTrails';
 import {
@@ -52,12 +52,64 @@ function getTrailCoordinates(trail) {
   return { latitude, longitude };
 }
 
+function getInitialZoom() {
+  const latitudeDelta = Number(INITIAL_REGION.latitudeDelta) || 20;
+  const longitudeDelta = Number(INITIAL_REGION.longitudeDelta) || 20;
+
+  return Math.max(
+    2,
+    Math.min(14, Math.log2(360 / Math.max(latitudeDelta, longitudeDelta)))
+  );
+}
+
+function getBoundsView(trails) {
+  if (!trails.length) return null;
+
+  const coordinates = trails
+    .map(getTrailCoordinates)
+    .filter(Boolean);
+
+  if (!coordinates.length) return null;
+
+  const minLat = Math.min(...coordinates.map((item) => item.latitude));
+  const maxLat = Math.max(...coordinates.map((item) => item.latitude));
+  const minLon = Math.min(...coordinates.map((item) => item.longitude));
+  const maxLon = Math.max(...coordinates.map((item) => item.longitude));
+
+  const latitude = (minLat + maxLat) / 2;
+  const longitude = (minLon + maxLon) / 2;
+
+  const latitudeSpan = Math.max(maxLat - minLat, 0.01);
+  const longitudeSpan = Math.max(maxLon - minLon, 0.01);
+  const span = Math.max(latitudeSpan, longitudeSpan);
+
+  const zoom = Math.max(
+    2,
+    Math.min(13, Math.log2(360 / (span * 1.6)))
+  );
+
+  return {
+    center: [longitude, latitude],
+    zoom,
+  };
+}
+
 export default function MapsScreen() {
   const router = useRouter();
   const params = useLocalSearchParams();
-  const mapRef = useRef(null);
+  const cameraRef = useRef(null);
 
   const [mapReady, setMapReady] = useState(false);
+  const [mapError, setMapError] = useState(null);
+  const [selectedTrailId, setSelectedTrailId] = useState(null);
+
+  const [cameraView, setCameraView] = useState({
+    center: [
+      Number(INITIAL_REGION.longitude) || 121.774,
+      Number(INITIAL_REGION.latitude) || 12.8797,
+    ],
+    zoom: getInitialZoom(),
+  });
 
   const {
     trails = [],
@@ -76,6 +128,7 @@ export default function MapsScreen() {
   const [handledTrailId, setHandledTrailId] = useState(null);
 
   const [locationLoading, setLocationLoading] = useState(false);
+  const [userLocation, setUserLocation] = useState(null);
   const [favoriteIds, setFavoriteIds] = useState([]);
   const [favoriteLoading, setFavoriteLoading] = useState(false);
 
@@ -140,19 +193,21 @@ export default function MapsScreen() {
 
   const validTrails = useMemo(
     () =>
-      trails.filter((trail) => getTrailCoordinates(trail) !== null),
+      trails
+        .map((trail) => {
+          const coordinates = getTrailCoordinates(trail);
+
+          if (!coordinates) return null;
+
+          return {
+            ...trail,
+            latitude: coordinates.latitude,
+            longitude: coordinates.longitude,
+          };
+        })
+        .filter(Boolean),
     [trails]
   );
-
-  useEffect(() => {
-  console.log('TRAIL DEBUG:', {
-    received: trails.length,
-    valid: validTrails.length,
-    loading,
-    error: error?.message ?? null,
-    firstTrail: trails[0],
-  });
-}, [trails, validTrails, loading, error]);
 
   const visibleTrails = useMemo(() => {
     const normalizedSearch = search.trim().toLowerCase();
@@ -174,37 +229,30 @@ export default function MapsScreen() {
     });
   }, [validTrails, filter, search]);
 
-  const fitTrails = useCallback((items) => {
-    if (!mapRef.current || items.length === 0) return;
+  const moveCamera = useCallback((view, duration = 650) => {
+    if (!view) return;
 
-    const coordinates = items
-      .map(getTrailCoordinates)
-      .filter(Boolean);
+    setCameraView(view);
 
-    if (coordinates.length === 0) return;
-
-    if (coordinates.length === 1) {
-      mapRef.current.animateToRegion(
-        {
-          ...coordinates[0],
-          latitudeDelta: 0.04,
-          longitudeDelta: 0.04,
-        },
-        650
-      );
-      return;
-    }
-
-    mapRef.current.fitToCoordinates(coordinates, {
-      edgePadding: {
-        top: 190,
-        right: 55,
-        bottom: 190,
-        left: 55,
-      },
-      animated: true,
+    requestAnimationFrame(() => {
+      cameraRef.current?.flyTo({
+        center: view.center,
+        zoom: view.zoom,
+        duration,
+      });
     });
   }, []);
+
+  const fitTrails = useCallback(
+    (items) => {
+      const view = getBoundsView(items);
+
+      if (view) {
+        moveCamera(view);
+      }
+    },
+    [moveCamera]
+  );
 
   useEffect(() => {
     if (!mapReady || loading || validTrails.length === 0) return;
@@ -218,20 +266,18 @@ export default function MapsScreen() {
         targetTrail &&
         handledTrailId !== String(requestedTrailId)
       ) {
-        const coordinates = getTrailCoordinates(targetTrail);
-
         setFilter('All');
         setSearch('');
         setSelected(targetTrail);
+        setSelectedTrailId(String(targetTrail.id));
 
-        mapRef.current?.animateToRegion(
-          {
-            ...coordinates,
-            latitudeDelta: 0.015,
-            longitudeDelta: 0.015,
-          },
-          650
-        );
+        moveCamera({
+          center: [
+            targetTrail.longitude,
+            targetTrail.latitude,
+          ],
+          zoom: 14,
+        });
 
         setHandledTrailId(String(requestedTrailId));
         return;
@@ -246,24 +292,28 @@ export default function MapsScreen() {
     requestedTrailId,
     handledTrailId,
     fitTrails,
+    moveCamera,
   ]);
 
-  const selectTrail = useCallback((trail) => {
-    setSelected(trail);
+  const selectTrail = useCallback(
+    (trail) => {
+      setSelected(trail);
+      setSelectedTrailId(String(trail.id));
 
-    const coordinates = getTrailCoordinates(trail);
+      const coordinates = getTrailCoordinates(trail);
 
-    if (coordinates) {
-      mapRef.current?.animateToRegion(
-        {
-          ...coordinates,
-          latitudeDelta: 0.015,
-          longitudeDelta: 0.015,
-        },
-        500
-      );
-    }
-  }, []);
+      if (coordinates) {
+        moveCamera({
+          center: [
+            coordinates.longitude,
+            coordinates.latitude,
+          ],
+          zoom: 14,
+        });
+      }
+    },
+    [moveCamera]
+  );
 
   const getCurrentLocation = useCallback(async () => {
     try {
@@ -283,16 +333,20 @@ export default function MapsScreen() {
       const position = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.Balanced,
       });
+      const coordinates = {
+        latitude: position.coords.latitude,
+        longitude: position.coords.longitude,
+      };
 
-      mapRef.current?.animateToRegion(
-        {
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-          latitudeDelta: 0.025,
-          longitudeDelta: 0.025,
-        },
-        650
-      );
+      setUserLocation(coordinates);
+
+      moveCamera({
+        center: [
+          coordinates.longitude,
+          coordinates.latitude,
+        ],
+        zoom: 14,
+      });
     } catch (e) {
       Alert.alert(
         'Unable to get location',
@@ -301,10 +355,11 @@ export default function MapsScreen() {
     } finally {
       setLocationLoading(false);
     }
-  }, []);
+  }, [moveCamera]);
 
   const showAll = useCallback(() => {
     setSelected(null);
+    setSelectedTrailId(null);
     setSearch('');
     setFilter('All');
 
@@ -316,6 +371,8 @@ export default function MapsScreen() {
   }, [validTrails, fitTrails, refetch]);
 
   const retry = useCallback(() => {
+    setMapError(null);
+
     if (typeof refetch === 'function') {
       refetch();
     }
@@ -324,29 +381,51 @@ export default function MapsScreen() {
   return (
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       <View style={styles.container}>
-        <MapView
-          ref={mapRef}
+        <Map
           style={styles.map}
-          mapType="satellite"
-          initialRegion={INITIAL_REGION}
-          onMapReady={() => setMapReady(true)}
-          onPress={() => setSelected(null)}
-          showsCompass
-          showsUserLocation
-          showsMyLocationButton={false}
-          toolbarEnabled={false}
-          moveOnMarkerPress={false}
-          loadingEnabled
+          mapStyle={OSM_STYLE}
+          onDidFinishLoadingMap={() => {
+            setMapReady(true);
+            setMapError(null);
+          }}
+          onDidFailLoadingMap={() => {
+            setMapError('Unable to load the map.');
+          }}
+          logo={false}
+          attribution
         >
+          <Camera
+            ref={cameraRef}
+            initialViewState={cameraView}
+            animationMode="flyTo"
+            animationDuration={650}
+          />
+
           {visibleTrails.map((trail) => (
             <TrailMarker
-              key={trail.id}
+              key={String(trail.id)}
               trail={trail}
-              selected={String(selected?.id) === String(trail.id)}
+              selected={selectedTrailId === String(trail.id)}
               onPress={() => selectTrail(trail)}
             />
           ))}
-        </MapView>
+
+          {userLocation && (
+            <Marker
+              id="current-user-location"
+              lngLat={[userLocation.longitude, userLocation.latitude]}
+              anchor="center"
+            >
+              <View
+                accessible
+                accessibilityLabel="Your current location"
+                style={styles.userLocationHalo}
+              >
+                <View style={styles.userLocationDot} />
+              </View>
+            </Marker>
+          )}
+        </Map>
 
         <View style={styles.topPanel}>
           <View style={styles.searchBox}>
@@ -465,6 +544,21 @@ export default function MapsScreen() {
           </View>
         )}
 
+        {mapError && (
+          <View style={styles.mapErrorCard}>
+            <Text style={styles.emptyTitle}>Map couldn't load</Text>
+            <Text style={styles.emptyText}>
+              Check your internet connection and try again.
+            </Text>
+            <TouchableOpacity
+              style={styles.clearButton}
+              onPress={retry}
+            >
+              <Text style={styles.clearButtonText}>Try again</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {!loading && !error && trails.length > 0 && validTrails.length === 0 && (
           <View style={styles.emptyCard}>
             <Text style={styles.emptyTitle}>Trail coordinates unavailable</Text>
@@ -496,7 +590,10 @@ export default function MapsScreen() {
 
         <TrailSheet
           trail={selected}
-          onClose={() => setSelected(null)}
+          onClose={() => {
+            setSelected(null);
+            setSelectedTrailId(null);
+          }}
           isFavorite={
             selected ? favoriteIds.includes(String(selected.id)) : false
           }
@@ -527,6 +624,25 @@ const styles = StyleSheet.create({
   },
   map: {
     ...StyleSheet.absoluteFillObject,
+  },
+  userLocationHalo: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(51, 181, 229, 0.24)',
+    borderWidth: 1,
+    borderColor: 'rgba(51, 181, 229, 0.4)',
+  },
+  userLocationDot: {
+    width: 14,
+    height: 14,
+    borderRadius: 7,
+    backgroundColor: '#168FE5',
+    borderWidth: 3,
+    borderColor: '#FFFFFF',
+    elevation: 3,
   },
   topPanel: {
     position: 'absolute',
@@ -663,6 +779,19 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.15,
     shadowRadius: 6,
     shadowOffset: { width: 0, height: 3 },
+  },
+  mapErrorCard: {
+    position: 'absolute',
+    top: '42%',
+    left: 24,
+    right: 24,
+    backgroundColor: '#FBF7F0',
+    borderWidth: 1,
+    borderColor: '#C9AD8A',
+    borderRadius: 20,
+    padding: 21,
+    alignItems: 'center',
+    elevation: 5,
   },
   emptyTitle: {
     marginTop: 9,

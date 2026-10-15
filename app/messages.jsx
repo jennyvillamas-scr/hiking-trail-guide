@@ -1,18 +1,19 @@
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    FlatList,
-    Image,
-    RefreshControl,
-    StatusBar,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  Image,
+  RefreshControl,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 
 const API_URL = 'https://hiking-trail-guide-api.vercel.app/api';
@@ -20,14 +21,15 @@ const API_URL = 'https://hiking-trail-guide-api.vercel.app/api';
 const COLORS = {
   main: '#694F2E',
   secondary: '#C9AD8A',
-  dark: '#3E2D1D',
-  cream: '#F8F4EE',
-  white: '#FFFFFF',
-  text: '#352B21',
-  muted: '#8B7A68',
-  border: '#E8DED1',
-  light: '#EFE4D5',
-  pale: '#F2E9DE',
+  background: '#694F2E',
+  container: '#C9AD8A',
+  cream: '#F7F0E6',
+  white: '#FBF7F0',
+  light: '#E8DCCB',
+  border: '#B89A75',
+  dark: '#352719',
+  text: '#352719',
+  muted: '#d1ae88',
 };
 
 function getUserName(user) {
@@ -64,14 +66,18 @@ export default function MessagesScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [failedPhotos, setFailedPhotos] = useState({});
+  const loadingRef = useRef(false);
+  const hasConversationsRef = useRef(false);
 
-  const loadConversations = useCallback(async (isRefresh = false) => {
+  const loadConversations = useCallback(async (isRefresh = false, silent = false) => {
+    if (loadingRef.current) return;
+
+    loadingRef.current = true;
     if (isRefresh) {
       setRefreshing(true);
-    } else {
+    } else if (!silent) {
       setLoading(true);
     }
-
     setLoadError('');
 
     try {
@@ -79,6 +85,7 @@ export default function MessagesScreen() {
 
       if (!token) {
         setConversations([]);
+        hasConversationsRef.current = false;
         setLoadError('Please log in again to view your messages.');
         return;
       }
@@ -102,26 +109,37 @@ export default function MessagesScreen() {
         );
       }
 
-      setConversations(
-        Array.isArray(data.conversations)
-          ? data.conversations
-          : []
-      );
+      const nextConversations = Array.isArray(data.conversations)
+        ? data.conversations
+        : [];
+      hasConversationsRef.current = nextConversations.length > 0;
+      setConversations(nextConversations);
 
       setFailedPhotos({});
     } catch (error) {
-      setLoadError(
-        error.message || 'Unable to connect to the server.'
-      );
+      const message =
+        error.message || 'Unable to connect to the server.';
+
+      if (silent && hasConversationsRef.current) {
+        console.warn('Unable to refresh conversations:', message);
+      } else {
+        setLoadError(message);
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
       setRefreshing(false);
+      loadingRef.current = false;
     }
   }, []);
 
   useFocusEffect(
     useCallback(() => {
       loadConversations();
+      const interval = setInterval(() => {
+        loadConversations(false, true);
+      }, 5000);
+
+      return () => clearInterval(interval);
     }, [loadConversations])
   );
 
@@ -236,9 +254,19 @@ export default function MessagesScreen() {
           </Text>
         </View>
 
-        <View style={styles.headingIcon}>
-          <Text style={styles.headingEmoji}>💬</Text>
-        </View>
+        <TouchableOpacity
+          style={styles.addButton}
+          activeOpacity={0.8}
+          onPress={() => router.push('/new-message')}
+          accessibilityRole="button"
+          accessibilityLabel="Start a new conversation"
+        >
+          <MaterialCommunityIcons
+            name="plus"
+            size={24}
+            color={COLORS.white}
+          />
+        </TouchableOpacity>
       </View>
 
       <View style={styles.searchContainer}>
@@ -284,7 +312,7 @@ export default function MessagesScreen() {
         <View style={styles.centerState}>
           <Text style={styles.stateEmoji}>⚠️</Text>
           <Text style={styles.emptyTitle}>
-            Couldn't load messages
+            Couldn&apos;t load messages
           </Text>
           <Text style={styles.emptyDescription}>
             {loadError}
@@ -334,19 +362,6 @@ export default function MessagesScreen() {
               : 'Your hiking connections will appear here. Start a conversation with another Verdant user to plan your next adventure.'}
           </Text>
 
-          {!search && (
-            <TouchableOpacity
-              style={styles.findButton}
-              activeOpacity={0.85}
-              onPress={() => router.push('/new-message')}
-            >
-              <Text style={styles.findButtonText}>
-                Find People
-              </Text>
-              <Text style={styles.buttonArrow}>→</Text>
-            </TouchableOpacity>
-          )}
-
           {search.length > 0 && (
             <TouchableOpacity
               style={styles.findButton}
@@ -370,11 +385,11 @@ export default function MessagesScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: COLORS.cream,
-    paddingHorizontal: 20,
-  },
+container: {
+  flex: 1,
+  backgroundColor: COLORS.main,
+  paddingHorizontal: 20,
+},
   heading: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -400,6 +415,17 @@ const styles = StyleSheet.create({
   },
   headingContent: {
     flex: 1,
+  },
+  addButton: {
+    width: 44,
+    height: 44,
+    marginLeft: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 15,
+    backgroundColor: COLORS.main,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   eyebrow: {
     color: COLORS.main,

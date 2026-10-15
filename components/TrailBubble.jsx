@@ -1,8 +1,8 @@
 
 import { MaterialCommunityIcons } from '@expo/vector-icons';
-import { memo, useEffect, useState } from 'react';
+import { Marker } from '@maplibre/maplibre-react-native';
+import { memo } from 'react';
 import { StyleSheet, View } from 'react-native';
-import { Marker } from 'react-native-maps';
 
 import { DIFFICULTY_COLORS } from '../constants/trailConfig';
 
@@ -65,9 +65,7 @@ function TrailBubble({ trail, selected = false }) {
       <View
         style={[
           styles.tip,
-          {
-            borderTopColor: color,
-          },
+          { borderTopColor: color },
         ]}
       />
     </View>
@@ -76,11 +74,15 @@ function TrailBubble({ trail, selected = false }) {
 
 export default memo(TrailBubble);
 
-export function TrailMarker({ trail, selected = false, onPress }) {
-  const [track, setTrack] = useState(true);
-
-  const latitude = Number(trail?.latitude);
-  const longitude = Number(trail?.longitude);
+export const TrailMarker = memo(function TrailMarker({
+  trail,
+  selected = false,
+  onPress,
+}) {
+  const latitude = Number(trail?.latitude ?? trail?.lat);
+  const longitude = Number(
+    trail?.longitude ?? trail?.lng ?? trail?.lon
+  );
 
   const validCoordinates =
     Number.isFinite(latitude) &&
@@ -90,35 +92,22 @@ export function TrailMarker({ trail, selected = false, onPress }) {
     longitude >= -180 &&
     longitude <= 180;
 
-  useEffect(() => {
-    setTrack(true);
-
-    const timer = setTimeout(() => {
-      setTrack(false);
-    }, 1500);
-
-    return () => clearTimeout(timer);
-  }, [selected, latitude, longitude]);
-
   if (!validCoordinates) {
     return null;
   }
 
   return (
     <Marker
-      coordinate={{
-        latitude,
-        longitude,
-      }}
+      id={`trail-${String(trail.id)}`}
+      lngLat={[longitude, latitude]}
+      anchor="bottom"
+      selected={selected}
       onPress={onPress}
-      anchor={{ x: 0.5, y: 1 }}
-      tracksViewChanges={track}
-      zIndex={selected ? 10 : 1}
     >
       <TrailBubble trail={trail} selected={selected} />
     </Marker>
   );
-}
+});
 
 const styles = StyleSheet.create({
   wrap: {
@@ -126,26 +115,22 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingBottom: 2,
   },
-
   stack: {
     width: BOX_W,
     height: BOX_H,
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   halo: {
     position: 'absolute',
     alignSelf: 'center',
   },
-
   pin: {
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 2.5,
     borderColor: '#ffffff',
   },
-
   tip: {
     width: 0,
     height: 0,

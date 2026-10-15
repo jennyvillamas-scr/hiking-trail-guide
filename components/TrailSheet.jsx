@@ -1,4 +1,3 @@
-
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as SecureStore from 'expo-secure-store';
 import { useEffect, useRef, useState } from 'react';
@@ -18,7 +17,12 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+
 import { DIFFICULTY_COLORS } from '../constants/trailConfig';
+import {
+  DEFAULT_TRAIL_IMAGE,
+  getTrailImages,
+} from '../constants/trailImages';
 
 const API_URL = 'https://hiking-trail-guide-api.vercel.app';
 
@@ -95,6 +99,8 @@ export default function TrailSheet({
   const trailKey =
     trail?.id != null ? String(trail.id) : trail?.name ?? '';
 
+  const trailImages = getTrailImages(trail);
+
   useEffect(() => {
     if (trail) {
       setPhotoIndex(0);
@@ -115,17 +121,47 @@ export default function TrailSheet({
     }
   }, [trail, translateY]);
 
+  const loadReviews = async () => {
+    if (!trailKey) return;
+
+    setReviewsLoading(true);
+    setReviewsError('');
+
+    try {
+      const response = await fetch(
+        `${API_URL}/api/trails/${encodeURIComponent(trailKey)}/reviews`
+      );
+
+      const data = await response.json();
+
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || 'Unable to load reviews.');
+      }
+
+      setReviews(Array.isArray(data.reviews) ? data.reviews : []);
+      setAverageRating(Number(data.averageRating) || 0);
+      setReviewCount(Number(data.count) || 0);
+    } catch (error) {
+      setReviewsError(
+        error.message || 'Could not connect to the review service.'
+      );
+    } finally {
+      setReviewsLoading(false);
+    }
+  };
+
   useEffect(() => {
     if (!trailKey) {
       setReviews([]);
       setAverageRating(0);
       setReviewCount(0);
+      setReviewsError('');
       return;
     }
 
     let cancelled = false;
 
-    async function loadReviews() {
+    async function fetchReviews() {
       setReviewsLoading(true);
       setReviewsError('');
       setReviews([]);
@@ -161,7 +197,7 @@ export default function TrailSheet({
       }
     }
 
-    loadReviews();
+    fetchReviews();
 
     return () => {
       cancelled = true;
@@ -176,11 +212,15 @@ export default function TrailSheet({
       return;
     }
 
-    const latitude = Number(trail.latitude);
-    const longitude = Number(trail.longitude);
+    const latitude = Number(trail.latitude ?? trail.lat);
+    const longitude = Number(trail.longitude ?? trail.lng ?? trail.lon);
     const name = trail.name ?? 'Hiking Trail';
 
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      Alert.alert(
+        'Location unavailable',
+        'Coordinates for this trail are not available.'
+      );
       return;
     }
 
@@ -206,14 +246,6 @@ export default function TrailSheet({
       Alert.alert(
         'Write a comment',
         'Please share your experience before submitting.'
-      );
-      return;
-    }
-
-    if (comment.length > 1000) {
-      Alert.alert(
-        'Comment too long',
-        'Your review must not exceed 1000 characters.'
       );
       return;
     }
@@ -267,31 +299,11 @@ export default function TrailSheet({
         throw new Error(data.message || 'Failed to save your review.');
       }
 
-      const savedReview = data.review;
-
-      setReviews((previous) => [
-        savedReview,
-        ...previous.filter(
-          (review) => String(review.id) !== String(savedReview.id)
-        ),
-      ]);
-
-      setReviewCount((previous) => previous + 1);
-
-      setAverageRating((previousAverage) => {
-        const previousCount = reviewCount;
-        return Number(
-          (
-            (previousAverage * previousCount + Number(savedReview.rating)) /
-            (previousCount + 1)
-          ).toFixed(1)
-        );
-      });
-
       setReviewComment('');
       setReviewRating(5);
-      setReviewsError('');
       Keyboard.dismiss();
+
+      await loadReviews();
 
       Alert.alert('Review posted', 'Your review has been saved and shared.');
     } catch (error) {
@@ -330,16 +342,18 @@ export default function TrailSheet({
               horizontal
               pagingEnabled
               showsHorizontalScrollIndicator={false}
-              onMomentumScrollEnd={(e) =>
+              onMomentumScrollEnd={(event) => {
                 setPhotoIndex(
-                  Math.round(e.nativeEvent.contentOffset.x / SCREEN_W)
-                )
-              }
+                  Math.round(
+                    event.nativeEvent.contentOffset.x / SCREEN_W
+                  )
+                );
+              }}
             >
-              {(trail.photos ?? []).map((uri, index) => (
+              {trailImages.map((image, index) => (
                 <Image
-                  key={`${uri}-${index}`}
-                  source={{ uri }}
+                  key={`${trailKey}-${index}`}
+                  source={image || DEFAULT_TRAIL_IMAGE}
                   style={styles.photo}
                   resizeMode="cover"
                 />
@@ -347,12 +361,12 @@ export default function TrailSheet({
             </ScrollView>
 
             <View style={styles.dots}>
-              {(trail.photos ?? []).map((_, i) => (
+              {trailImages.map((_, index) => (
                 <View
-                  key={i}
+                  key={index}
                   style={[
                     styles.dot,
-                    i === photoIndex && styles.dotActive,
+                    index === photoIndex && styles.dotActive,
                   ]}
                 />
               ))}
@@ -402,18 +416,28 @@ export default function TrailSheet({
                     },
                   ]}
                 >
-                  <Text style={styles.badgeText}>{trail.difficulty}</Text>
+                  <Text style={styles.badgeText}>
+                    {trail.difficulty}
+                  </Text>
                 </View>
               </View>
 
               <View style={styles.statsRow}>
-                <Stat label="Distance" value={`${trail.distanceKm ?? '—'} km`} />
-                <Stat label="Elevation" value={`${trail.elevationM ?? '—'} m`} />
+                <Stat
+                  label="Distance"
+                  value={`${trail.distanceKm ?? '—'} km`}
+                />
+                <Stat
+                  label="Elevation"
+                  value={`${trail.elevationM ?? '—'} m`}
+                />
                 <Stat label="Duration" value={trail.duration} />
               </View>
 
               <Text style={styles.sectionTitle}>About</Text>
-              <Text style={styles.paragraph}>{trail.description}</Text>
+              <Text style={styles.paragraph}>
+                {trail.description}
+              </Text>
 
               <Text style={styles.sectionTitle}>Highlights</Text>
 
@@ -426,7 +450,9 @@ export default function TrailSheet({
               </View>
 
               <Text style={styles.sectionTitle}>Best season</Text>
-              <Text style={styles.paragraph}>{trail.bestSeason}</Text>
+              <Text style={styles.paragraph}>
+                {trail.bestSeason}
+              </Text>
 
               <TouchableOpacity
                 style={styles.button}
@@ -440,14 +466,18 @@ export default function TrailSheet({
               <View style={styles.reviewsSection}>
                 <View style={styles.reviewsHeading}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.sectionTitle}>Reviews & Comments</Text>
+                    <Text style={styles.sectionTitle}>
+                      Reviews &amp; Comments
+                    </Text>
                     <Text style={styles.reviewSubtitle}>
                       Share your experience on this trail.
                     </Text>
                   </View>
 
                   <View style={styles.reviewCountBadge}>
-                    <Text style={styles.reviewCountText}>{reviewCount}</Text>
+                    <Text style={styles.reviewCountText}>
+                      {reviewCount}
+                    </Text>
                   </View>
                 </View>
 
@@ -456,7 +486,6 @@ export default function TrailSheet({
                     <Text style={styles.ratingNumber}>
                       {reviewCount ? averageRating.toFixed(1) : '—'}
                     </Text>
-
                     <Text style={styles.ratingOutOf}>
                       {reviewCount
                         ? `out of 5 · ${reviewCount} ${
@@ -474,7 +503,6 @@ export default function TrailSheet({
 
                 <View style={styles.reviewForm}>
                   <Text style={styles.formTitle}>Write a review</Text>
-
                   <Text style={styles.inputLabel}>Your rating</Text>
 
                   <Stars
@@ -516,7 +544,9 @@ export default function TrailSheet({
                     {submittingReview ? (
                       <ActivityIndicator color="#FFFFFF" />
                     ) : (
-                      <Text style={styles.submitReviewText}>Post Review</Text>
+                      <Text style={styles.submitReviewText}>
+                        Post Review
+                      </Text>
                     )}
                   </TouchableOpacity>
                 </View>
@@ -527,53 +557,39 @@ export default function TrailSheet({
 
                 {reviewsLoading ? (
                   <View style={styles.loadingReviews}>
-                    <ActivityIndicator size="small" color="#694F2E" />
-                    <Text style={styles.loadingText}>Loading reviews...</Text>
+                    <ActivityIndicator
+                      size="small"
+                      color="#694F2E"
+                    />
+                    <Text style={styles.loadingText}>
+                      Loading reviews...
+                    </Text>
                   </View>
                 ) : reviewsError && reviews.length === 0 ? (
                   <View style={styles.emptyReviews}>
                     <Text style={styles.emptyReviewTitle}>
                       Unable to load reviews
                     </Text>
-                    <Text style={styles.emptyReviewText}>{reviewsError}</Text>
+                    <Text style={styles.emptyReviewText}>
+                      {reviewsError}
+                    </Text>
 
                     <TouchableOpacity
                       style={styles.retryButton}
-                      onPress={() => {
-                        setReviewsError('');
-                        setReviewsLoading(true);
-
-                        fetch(
-                          `${API_URL}/api/trails/${encodeURIComponent(trailKey)}/reviews`
-                        )
-                          .then(async (response) => {
-                            const data = await response.json();
-
-                            if (!response.ok || !data.success) {
-                              throw new Error(
-                                data.message || 'Unable to load reviews.'
-                              );
-                            }
-
-                            setReviews(data.reviews ?? []);
-                            setAverageRating(Number(data.averageRating) || 0);
-                            setReviewCount(Number(data.count) || 0);
-                          })
-                          .catch((error) => {
-                            setReviewsError(
-                              error.message || 'Could not load reviews.'
-                            );
-                          })
-                          .finally(() => setReviewsLoading(false));
-                      }}
+                      onPress={loadReviews}
+                      disabled={reviewsLoading}
                     >
-                      <Text style={styles.retryButtonText}>Try Again</Text>
+                      <Text style={styles.retryButtonText}>
+                        Try Again
+                      </Text>
                     </TouchableOpacity>
                   </View>
                 ) : reviews.length === 0 ? (
                   <View style={styles.emptyReviews}>
                     <Text style={styles.emptyReviewIcon}>💬</Text>
-                    <Text style={styles.emptyReviewTitle}>No reviews yet</Text>
+                    <Text style={styles.emptyReviewTitle}>
+                      No reviews yet
+                    </Text>
                     <Text style={styles.emptyReviewText}>
                       Be the first to share your experience on {trail.name}.
                     </Text>
@@ -584,25 +600,41 @@ export default function TrailSheet({
                       review.reviewerName || review.name || 'Hiker';
 
                     return (
-                      <View key={String(review.id)} style={styles.reviewCard}>
+                      <View
+                        key={String(review.id)}
+                        style={styles.reviewCard}
+                      >
                         <View style={styles.reviewerHeader}>
-                          <View style={styles.avatar}>
-                            <Text style={styles.avatarText}>
-                              {reviewerName.charAt(0).toUpperCase()}
-                            </Text>
-                          </View>
+                          {review.profilePhoto ? (
+                            <Image
+                              source={{ uri: review.profilePhoto }}
+                              style={styles.avatar}
+                              resizeMode="cover"
+                            />
+                          ) : (
+                            <View style={styles.avatar}>
+                              <Text style={styles.avatarText}>
+                                {reviewerName.charAt(0).toUpperCase()}
+                              </Text>
+                            </View>
+                          )}
 
                           <View style={styles.reviewerInfo}>
                             <Text style={styles.reviewerName}>
                               {reviewerName}
                             </Text>
                             <Text style={styles.reviewDate}>
-                              {formatReviewDate(review.createdAt || review.date)}
+                              {formatReviewDate(
+                                review.createdAt || review.date
+                              )}
                             </Text>
                           </View>
                         </View>
 
-                        <Stars rating={Number(review.rating) || 0} size={17} />
+                        <Stars
+                          rating={Number(review.rating) || 0}
+                          size={17}
+                        />
 
                         <Text style={styles.reviewComment}>
                           {review.comment}
@@ -792,8 +824,29 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '600',
   },
-  button: {
+  downloadButton: {
     marginTop: 22,
+    backgroundColor: '#E8DCCB',
+    borderWidth: 1,
+    borderColor: '#C9AD8A',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+  },
+  downloadButtonSaved: {
+    backgroundColor: '#E3D6C4',
+  },
+  downloadButtonText: {
+    color: '#694F2E',
+    fontWeight: '700',
+    fontSize: 14,
+  },
+  button: {
+    marginTop: 12,
     backgroundColor: '#694F2E',
     paddingVertical: 15,
     borderRadius: 12,
@@ -991,6 +1044,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 10,
+    overflow: 'hidden',
   },
   avatarText: {
     color: '#694F2E',

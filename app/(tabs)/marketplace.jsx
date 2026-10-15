@@ -2,19 +2,19 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useMemo, useState } from 'react';
 import {
-    Image,
-    Modal,
-    ScrollView,
-    StatusBar,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  Image,
+  Modal,
+  ScrollView,
+  StatusBar,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-const GREEN = '#245C43';
+const GREEN = '#66544a';
 const CREAM = '#F4F6F2';
 const MUTED = '#89938C';
 const DARK = '#26372D';
@@ -555,11 +555,11 @@ export default function MarketplaceScreen() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: CREAM,
+    backgroundColor: '#694F2E',
   },
   container: {
     flex: 1,
-    backgroundColor: CREAM,
+    backgroundColor: '#694F2E',
   },
   hero: {
     backgroundColor: '#694F2E',
@@ -576,7 +576,7 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   eyebrow: {
-    color: '#DCC6A9',
+    color: '#C9AD8A',
     fontSize: 10,
     fontWeight: '900',
     letterSpacing: 1.8,
@@ -589,7 +589,7 @@ const styles = StyleSheet.create({
     lineHeight: 34,
   },
   heroSubtitle: {
-    color: '#F0E4D4',
+    color: '#F7F0E6',
     fontSize: 12,
     marginTop: 9,
     lineHeight: 18,
@@ -611,7 +611,7 @@ const styles = StyleSheet.create({
   searchBox: {
     height: 49,
     borderRadius: 14,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: '#F7F0E6',
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 13,
@@ -632,11 +632,11 @@ const styles = StyleSheet.create({
   sectionTitle: {
     fontSize: 17,
     fontWeight: '900',
-    color: '#352719',
+    color: '#FFFFFF',
   },
   sectionSubtitle: {
     fontSize: 11,
-    color: '#6E573F',
+    color: '#F0E4D4',
     marginTop: 4,
   },
   categoryList: {
@@ -647,21 +647,21 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 10,
     borderRadius: 22,
-    backgroundColor: '#FBF7F0',
+    backgroundColor: '#C9AD8A',
     borderWidth: 1,
     borderColor: '#C9AD8A',
   },
   categoryChipActive: {
-    backgroundColor: '#694F2E',
-    borderColor: '#694F2E',
+    backgroundColor: '#F7F0E6',
+    borderColor: '#F7F0E6',
   },
   categoryText: {
-    color: '#6E573F',
+    color: '#352719',
     fontSize: 11,
     fontWeight: '700',
   },
   categoryTextActive: {
-    color: '#FFFFFF',
+    color: '#694F2E',
   },
   productsHeading: {
     marginTop: 23,
@@ -678,7 +678,7 @@ const styles = StyleSheet.create({
   },
   productCard: {
     width: '48.5%',
-    backgroundColor: '#FBF7F0',
+    backgroundColor: '#C9AD8A',
     borderRadius: 16,
     overflow: 'hidden',
     borderWidth: 1,
@@ -711,7 +711,7 @@ const styles = StyleSheet.create({
     paddingTop: 10,
   },
   productCategory: {
-    color: '#8D785F',
+    color: '#594735',
     fontSize: 8,
     fontWeight: '900',
     letterSpacing: 0.7,
@@ -732,7 +732,7 @@ const styles = StyleSheet.create({
   },
   ratingText: {
     fontSize: 10,
-    color: '#6E573F',
+    color: '#594735',
     fontWeight: '700',
   },
   productPrice: {
@@ -753,7 +753,7 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#E8DCCB',
+    backgroundColor: '#F7F0E6',
     borderRadius: 9,
     paddingVertical: 9,
   },
@@ -768,14 +768,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 10,
-    backgroundColor: '#E8DCCB',
+    backgroundColor: '#F7F0E6',
   },
   heartButtonActive: {
     backgroundColor: '#E8C9C2',
   },
   emptyState: {
     alignItems: 'center',
-    backgroundColor: '#FBF7F0',
+    backgroundColor: '#C9AD8A',
     borderRadius: 18,
     borderWidth: 1,
     borderColor: '#DCC6A9',
@@ -789,7 +789,7 @@ const styles = StyleSheet.create({
     marginTop: 12,
   },
   emptySubtitle: {
-    color: '#6E573F',
+    color: '#594735',
     fontSize: 12,
     marginTop: 6,
   },
@@ -812,18 +812,18 @@ const styles = StyleSheet.create({
     marginTop: 23,
     padding: 13,
     borderRadius: 13,
-    backgroundColor: '#E8DCCB',
+    backgroundColor: '#C9AD8A',
   },
   disclaimerText: {
     flex: 1,
-    color: '#594735',
+    color: '#352719',
     fontSize: 10,
     lineHeight: 16,
   },
   modalBackdrop: {
     flex: 1,
     justifyContent: 'flex-end',
-    backgroundColor: 'rgba(53, 39, 25, 0.55)',
+    backgroundColor: 'rgba(53, 39, 25, 0.65)',
   },
   modalCard: {
     maxHeight: '90%',
@@ -849,7 +849,7 @@ const styles = StyleSheet.create({
     height: 235,
     borderRadius: 18,
     overflow: 'hidden',
-    backgroundColor: '#E8DCCB',
+    backgroundColor: '#C9AD8A',
   },
   modalImage: {
     width: '100%',
@@ -916,7 +916,7 @@ const styles = StyleSheet.create({
   sellerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: '#FBF7F0',
+    backgroundColor: '#C9AD8A',
     borderRadius: 14,
     padding: 12,
     marginTop: 20,
@@ -927,7 +927,7 @@ const styles = StyleSheet.create({
     width: 43,
     height: 43,
     borderRadius: 13,
-    backgroundColor: '#E8DCCB',
+    backgroundColor: '#F7F0E6',
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -936,7 +936,7 @@ const styles = StyleSheet.create({
   },
   sellerLabel: {
     fontSize: 10,
-    color: '#6E573F',
+    color: '#594735',
   },
   sellerName: {
     color: '#352719',

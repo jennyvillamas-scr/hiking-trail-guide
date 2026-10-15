@@ -1,7 +1,7 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
     ActivityIndicator,
     Alert,
@@ -34,8 +34,10 @@ export default function NewMessageScreen() {
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const requestIdRef = useRef(0);
 
-  const loadUsers = useCallback(async () => {
+  const loadUsers = useCallback(async (query = '') => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError('');
 
@@ -43,11 +45,18 @@ export default function NewMessageScreen() {
       const token = await SecureStore.getItemAsync('authToken');
 
       if (!token) {
-        setError('Please sign in again to view users.');
+        if (requestId === requestIdRef.current) {
+          setUsers([]);
+          setError('Please sign in again to view users.');
+        }
         return;
       }
 
-      const response = await fetch(`${API_URL}/chat/users`, {
+      const searchQuery = query.trim();
+      const searchParam = searchQuery
+        ? `?search=${encodeURIComponent(searchQuery)}`
+        : '';
+      const response = await fetch(`${API_URL}/chat/users${searchParam}`, {
         method: 'GET',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -65,40 +74,38 @@ export default function NewMessageScreen() {
         ? data
         : data.users || data.data || [];
 
-      setUsers(Array.isArray(userList) ? userList : []);
+      if (requestId === requestIdRef.current) {
+        setUsers(Array.isArray(userList) ? userList : []);
+      }
     } catch (err) {
-      setError(
-        err.message === 'Endpoint not found.'
-          ? 'The users endpoint is not available on the deployed backend yet.'
-          : err.message || 'Unable to connect to the server.'
-      );
+      if (requestId === requestIdRef.current) {
+        setError(
+          err.message === 'Endpoint not found.'
+            ? 'The users endpoint is not available on the deployed backend yet.'
+            : err.message || 'Unable to connect to the server.'
+        );
+      }
     } finally {
-      setLoading(false);
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    loadUsers();
-  }, [loadUsers]);
+    const timeout = setTimeout(
+      () => loadUsers(search),
+      search.trim() ? 300 : 0
+    );
 
-  const filteredUsers = useMemo(() => {
-    const query = search.trim().toLowerCase();
-
-    if (!query) return users;
-
-    return users.filter((user) => {
-      const name =
-        user.display_name ||
-        user.username ||
-        [user.fname, user.lname].filter(Boolean).join(' ') ||
-        user.name ||
-        '';
-
-      return name.toLowerCase().includes(query);
-    });
-  }, [search, users]);
+    return () => {
+      clearTimeout(timeout);
+      requestIdRef.current += 1;
+    };
+  }, [loadUsers, search]);
 
   const getUserName = (user) =>
+    user.displayName ||
     user.display_name ||
     user.username ||
     [user.fname, user.lname].filter(Boolean).join(' ') ||
@@ -201,7 +208,7 @@ export default function NewMessageScreen() {
 
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>PEOPLE</Text>
-        <Text style={styles.count}>{users.length} users</Text>
+        <Text style={styles.count}>{users.length} found</Text>
       </View>
 
       {loading ? (
@@ -218,11 +225,11 @@ export default function NewMessageScreen() {
               color={COLORS.main}
             />
           </View>
-          <Text style={styles.stateTitle}>Couldn't load users</Text>
+          <Text style={styles.stateTitle}>Couldn&apos;t load users</Text>
           <Text style={styles.stateText}>{error}</Text>
           <TouchableOpacity
             style={styles.retryButton}
-            onPress={loadUsers}
+            onPress={() => loadUsers(search)}
             activeOpacity={0.8}
           >
             <MaterialCommunityIcons
@@ -233,7 +240,7 @@ export default function NewMessageScreen() {
             <Text style={styles.retryText}>Try Again</Text>
           </TouchableOpacity>
         </View>
-      ) : filteredUsers.length === 0 ? (
+      ) : users.length === 0 ? (
         <View style={styles.centerState}>
           <View style={styles.stateIcon}>
             <MaterialCommunityIcons
@@ -261,7 +268,7 @@ export default function NewMessageScreen() {
         </View>
       ) : (
         <FlatList
-          data={filteredUsers}
+          data={users}
           keyExtractor={(item, index) =>
             String(item.id ?? item.user_id ?? index)
           }
@@ -269,7 +276,7 @@ export default function NewMessageScreen() {
           contentContainerStyle={styles.listContent}
           showsVerticalScrollIndicator={false}
           refreshing={loading}
-          onRefresh={loadUsers}
+          onRefresh={() => loadUsers(search)}
         />
       )}
 
