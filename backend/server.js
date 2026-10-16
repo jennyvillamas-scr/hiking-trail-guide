@@ -75,6 +75,16 @@ const dbReady = (async () => {
     )
   `);
 
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      user_id INTEGER PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
   let columns = await db.execute("PRAGMA table_info(users)");
 
   if (!columns.rows.some((column) => column.name === "display_name")) {
@@ -468,6 +478,206 @@ app.post(
   })
 );
 
+app.post(
+  "/api/auth/forgot-password",
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(503).json({
+        success: false,
+        message: "Password reset is temporarily unavailable. Please try again later.",
+      });
+    }
+
+    const email =
+      typeof req.body?.email === "string"
+        ? req.body.email.trim().toLowerCase()
+        : "";
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    const userResult = await db.execute({
+      sql: "SELECT id, email FROM users WHERE email = ? COLLATE NOCASE",
+      args: [email],
+    });
+    const user = userResult.rows[0];
+    const genericMessage =
+      "If an account exists for that email, a password reset link will be sent.";
+
+    if (!user) {
+      return res.json({ success: true, message: genericMessage });
+    }
+
+    const now = Date.now();
+    const priorRequest = await db.execute({
+      sql: `
+        SELECT created_at
+        FROM password_reset_tokens
+        WHERE user_id = ?
+      `,
+      args: [Number(user.id)],
+    });
+
+    if (
+      priorRequest.rows[0] &&
+      now - Number(priorRequest.rows[0].created_at) < 60_000
+    ) {
+      return res.json({ success: true, message: genericMessage });
+    }
+
+    const token = crypto.randomBytes(32).toString("base64url");
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+    const expiresAt = now + 60 * 60 * 1000;
+
+    await db.execute({
+      sql: `
+        INSERT INTO password_reset_tokens (
+          user_id, token_hash, expires_at, created_at
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          token_hash = excluded.token_hash,
+          expires_at = excluded.expires_at,
+          created_at = excluded.created_at
+      `,
+      args: [Number(user.id), tokenHash, expiresAt, now],
+    });
+
+    const resetUrl =
+      `hikingapp://reset-password?token=${encodeURIComponent(token)}`;
+    const from =
+      process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev";
+
+    try {
+      const emailResponse = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from,
+          to: [user.email],
+          subject: "Reset your PEAKLY password",
+          text:
+            `We received a request to reset your PEAKLY password.\n\n` +
+            `Open this link to choose a new password (it expires in one hour):\n${resetUrl}\n\n` +
+            "If you did not request this, you can ignore this email.",
+          html:
+            `<p>We received a request to reset your PEAKLY password.</p>` +
+            `<p><a href="${resetUrl}">Choose a new password</a></p>` +
+            `<p>This link expires in one hour. If you did not request this, you can ignore this email.</p>`,
+        }),
+      });
+
+      if (!emailResponse.ok) {
+        throw new Error(
+          `Resend request failed with status ${emailResponse.status}.`
+        );
+      }
+    } catch (error) {
+      await db.execute({
+        sql: `
+          DELETE FROM password_reset_tokens
+          WHERE user_id = ? AND token_hash = ?
+        `,
+        args: [Number(user.id), tokenHash],
+      });
+      console.error("Password reset email failed:", error.message);
+      return res.status(502).json({
+        success: false,
+        message: "Unable to send the reset email right now. Please try again later.",
+      });
+    }
+
+    return res.json({ success: true, message: genericMessage });
+  })
+);
+
+app.post(
+  "/api/auth/reset-password",
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const { token, password } = req.body || {};
+
+    if (
+      typeof token !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(token)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "This password reset link is invalid or has expired.",
+      });
+    }
+
+    if (
+      typeof password !== "string" ||
+      password.length < 8 ||
+      Buffer.byteLength(password, "utf8") > 72
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 8 characters and no more than 72 bytes.",
+      });
+    }
+
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+    const transaction = await db.transaction("write");
+
+    try {
+      const tokenResult = await transaction.execute({
+        sql: `
+          SELECT user_id
+          FROM password_reset_tokens
+          WHERE token_hash = ? AND expires_at > ?
+        `,
+        args: [tokenHash, Date.now()],
+      });
+      const userId = tokenResult.rows[0]?.user_id;
+
+      if (!userId) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: "This password reset link is invalid or has expired.",
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(password, 12);
+      await transaction.execute({
+        sql: "UPDATE users SET password_hash = ? WHERE id = ?",
+        args: [passwordHash, Number(userId)],
+      });
+      await transaction.execute({
+        sql: "DELETE FROM password_reset_tokens WHERE user_id = ?",
+        args: [Number(userId)],
+      });
+      await transaction.commit();
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+
+    return res.json({
+      success: true,
+      message: "Your password has been reset. You can now sign in.",
+    });
+  })
+);
+
 app.get(
   "/api/profile",
   requireAuth,
@@ -527,6 +737,176 @@ app.get(
           savedTrails: Number(favorites.rows[0].count),
         },
       },
+    });
+  })
+);
+
+app.put(
+  "/api/profile/password",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const { currentPassword, newPassword } = req.body || {};
+
+    if (
+      typeof currentPassword !== "string" ||
+      typeof newPassword !== "string" ||
+      !currentPassword ||
+      !newPassword
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Current and new passwords are required.",
+      });
+    }
+
+    if (
+      newPassword.length < 8 ||
+      Buffer.byteLength(newPassword, "utf8") > 72
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 8 characters and no more than 72 bytes.",
+      });
+    }
+
+    const userResult = await db.execute({
+      sql: "SELECT password_hash FROM users WHERE id = ?",
+      args: [req.userId],
+    });
+    const user = userResult.rows[0];
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User account not found.",
+      });
+    }
+
+    if (!(await bcrypt.compare(currentPassword, user.password_hash))) {
+      return res.status(401).json({
+        success: false,
+        message: "Your current password is incorrect.",
+      });
+    }
+
+    if (await bcrypt.compare(newPassword, user.password_hash)) {
+      return res.status(400).json({
+        success: false,
+        message: "Choose a new password that is different from your current password.",
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    await db.execute({
+      sql: "UPDATE users SET password_hash = ? WHERE id = ?",
+      args: [passwordHash, req.userId],
+    });
+
+    return res.json({
+      success: true,
+      message: "Your password has been updated.",
+    });
+  })
+);
+
+app.delete(
+  "/api/profile/account",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const { password } = req.body || {};
+
+    if (typeof password !== "string" || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Your current password is required to delete your account.",
+      });
+    }
+
+    const userResult = await db.execute({
+      sql: "SELECT password_hash FROM users WHERE id = ?",
+      args: [req.userId],
+    });
+    const user = userResult.rows[0];
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User account not found.",
+      });
+    }
+
+    if (!(await bcrypt.compare(password, user.password_hash))) {
+      return res.status(401).json({
+        success: false,
+        message: "The password you entered is incorrect.",
+      });
+    }
+
+    const transaction = await db.transaction("write");
+
+    try {
+      await transaction.execute({
+        sql: `
+          DELETE FROM messages
+          WHERE sender_id = ?
+            OR conversation_id IN (
+              SELECT id
+              FROM conversations
+              WHERE user_one_id = ? OR user_two_id = ?
+            )
+        `,
+        args: [req.userId, req.userId, req.userId],
+      });
+      await transaction.execute({
+        sql: `
+          DELETE FROM conversations
+          WHERE user_one_id = ? OR user_two_id = ?
+        `,
+        args: [req.userId, req.userId],
+      });
+      await transaction.execute({
+        sql: "DELETE FROM reviews WHERE user_id = ?",
+        args: [req.userId],
+      });
+      await transaction.execute({
+        sql: "DELETE FROM favorites WHERE user_id = ?",
+        args: [req.userId],
+      });
+      await transaction.execute({
+        sql: "DELETE FROM tracks WHERE user_id = ?",
+        args: [req.userId],
+      });
+      await transaction.execute({
+        sql: "DELETE FROM password_reset_tokens WHERE user_id = ?",
+        args: [req.userId],
+      });
+
+      const deleteResult = await transaction.execute({
+        sql: "DELETE FROM users WHERE id = ?",
+        args: [req.userId],
+      });
+
+      if (!Number(deleteResult.rowsAffected)) {
+        await transaction.rollback();
+        return res.status(404).json({
+          success: false,
+          message: "User account not found.",
+        });
+      }
+
+      await transaction.commit();
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+
+    return res.json({
+      success: true,
+      message: "Your account and associated data have been deleted.",
     });
   })
 );
@@ -1417,6 +1797,70 @@ app.get(
         unreadCount: Number(row.unread_count || 0),
       })),
     });
+  })
+);
+
+app.delete(
+  "/api/chat/conversations/:id",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await dbReady;
+
+    const conversationId = Number(req.params.id);
+
+    if (
+      !Number.isSafeInteger(conversationId) ||
+      conversationId <= 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid conversation ID.",
+      });
+    }
+
+    const transaction = await db.transaction("write");
+
+    try {
+      const conversation = await transaction.execute({
+        sql: `
+          SELECT id
+          FROM conversations
+          WHERE id = ?
+            AND (user_one_id = ? OR user_two_id = ?)
+        `,
+        args: [conversationId, req.userId, req.userId],
+      });
+
+      if (!conversation.rows.length) {
+        await transaction.rollback();
+        return res.status(404).json({
+          success: false,
+          message: "Conversation not found.",
+        });
+      }
+
+      await transaction.execute({
+        sql: "DELETE FROM messages WHERE conversation_id = ?",
+        args: [conversationId],
+      });
+      await transaction.execute({
+        sql: `
+          DELETE FROM conversations
+          WHERE id = ?
+            AND (user_one_id = ? OR user_two_id = ?)
+        `,
+        args: [conversationId, req.userId, req.userId],
+      });
+      await transaction.commit();
+
+      return res.json({
+        success: true,
+        message: "Conversation and messages deleted.",
+      });
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
   })
 );
 
